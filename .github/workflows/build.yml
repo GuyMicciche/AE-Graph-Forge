@@ -1,0 +1,162 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Validate before spending time on three platform builds.
+  # -------------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-cursor0
+
+      - name: Byte-compile
+        run: python -m compileall -q aegraphforge
+
+      - name: Generate every chart type
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -e
+          for t in line area connected_scatter scatter bar hbar; do
+            python forge_cli.py build examples/data.csv -o "out_$t.jsx" \
+              --type "$t" --x Launch_Date --y Bandwidth_Mbps \
+              --sort Launch_Date --color-by Orbit_Type
+          done
+
+      - name: Validate generated ExtendScript
+        run: |
+          set -e
+          for f in out_*.jsx; do cp "$f" "${f%.jsx}.js"; node --check "${f%.jsx}.js"; done
+          node tools/ae_mock_check.js out_*.jsx
+
+  # -------------------------------------------------------------------------
+  # Build a standalone app for each platform.
+  # -------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.name }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+            artifact: AEGraphForge-windows
+          - os: macos-latest
+            name: macos
+            artifact: AEGraphForge-macos
+          - os: ubuntu-22.04
+            name: linux
+            artifact: AEGraphForge-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Qt runtime libraries (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-cursor0
+
+      - name: Build (Windows)
+        if: matrix.name == 'windows'
+        run: .\build.bat
+        shell: cmd
+
+      - name: Build (macOS / Linux)
+        if: matrix.name != 'windows'
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          set -e
+          mkdir -p staging
+          if [ "${{ matrix.name }}" = "macos" ]; then
+            cp -R "dist/AEGraphForge.app" staging/
+          elif [ "${{ matrix.name }}" = "windows" ]; then
+            cp -R dist/AEGraphForge staging/
+          else
+            cp -R dist/AEGraphForge staging/
+          fi
+          cp README.md staging/
+          cp -R presets staging/presets
+          cp -R examples staging/examples
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging
+          if-no-files-found: error
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # On a version tag, attach the three builds to a GitHub Release.
+  # -------------------------------------------------------------------------
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip each build
+        run: |
+          cd artifacts
+          for d in */; do
+            name="${d%/}"
+            (cd "$name" && zip -qr "../${name}.zip" .)
+          done
+          ls -la *.zip
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true

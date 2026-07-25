@@ -1,0 +1,199 @@
+{
+  "chart_type": "connected_scatter",
+  "x_column": "Latency_ms",
+  "sort_column": "Launch_Date",
+  "sort_ascending": true,
+  "group_column": "",
+  "aggregation": "sum",
+  "max_bars": 20,
+  "arc_mode": "chord",
+  "bar_gap": 0.28,
+  "series": [
+    {
+      "column": "Bandwidth_Mbps",
+      "label": "Bandwidth_Mbps",
+      "color": [
+        0.95,
+        0.95,
+        0.95
+      ],
+      "axis": "left",
+      "transform": "none",
+      "window": 8,
+      "stroke_width": 4.0,
+      "show_line": true,
+      "show_dots": false,
+      "dot_size": 10.0,
+      "fill_opacity": 0.0,
+      "smooth": true
+    }
+  ],
+  "x_axis": {
+    "title": "",
+    "unit": "",
+    "auto_min": true,
+    "auto_max": true,
+    "vmin": 0.0,
+    "vmax": 1.0,
+    "scale": "linear",
+    "tick_count": 6,
+    "nice_ticks": true,
+    "decimals": -1,
+    "thousands_sep": true,
+    "show_grid": true,
+    "label_size": 22.0,
+    "enabled": true
+  },
+  "y_axis": {
+    "title": "",
+    "unit": "",
+    "auto_min": true,
+    "auto_max": true,
+    "vmin": 0.0,
+    "vmax": 1.0,
+    "scale": "linear",
+    "tick_count": 6,
+    "nice_ticks": true,
+    "decimals": -1,
+    "thousands_sep": true,
+    "show_grid": true,
+    "label_size": 22.0,
+    "enabled": true
+  },
+  "y2_axis": {
+    "title": "",
+    "unit": "",
+    "auto_min": true,
+    "auto_max": true,
+    "vmin": 0.0,
+    "vmax": 1.0,
+    "scale": "linear",
+    "tick_count": 6,
+    "nice_ticks": true,
+    "decimals": -1,
+    "thousands_sep": true,
+    "show_grid": true,
+    "label_size": 22.0,
+    "enabled": false
+  },
+  "category": {
+    "column": "Orbit_Type",
+    "enabled": true,
+    "colors": {
+      "LEO": [
+        0.4,
+        0.85,
+        0.9
+      ],
+      "GEO": [
+        0.95,
+        0.7,
+        0.35
+      ],
+      "MEO": [
+        0.9,
+        0.45,
+        0.65
+      ]
+    },
+    "show_legend": true
+  },
+  "size": {
+    "column": "Altitude_km",
+    "enabled": true,
+    "min_diameter": 10.0,
+    "max_diameter": 46.0,
+    "sqrt_scale": true,
+    "show_legend": true
+  },
+  "comp": {
+    "name": "SAT_Altitude_Age_Effects",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30.0,
+    "duration": 14.0,
+    "plot_left": 220.0,
+    "plot_right": 1800.0,
+    "plot_top": 170.0,
+    "plot_bottom": 860.0,
+    "progress_start": 1.0,
+    "progress_end": 12.0,
+    "ease_influence": 33.0,
+    "open_in_viewer": true
+  },
+  "style": {
+    "bg_color": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "grid_color": [
+      0.25,
+      0.25,
+      0.27
+    ],
+    "grid_opacity": 45.0,
+    "grid_width": 2.0,
+    "axis_text_color": [
+      0.75,
+      0.78,
+      0.82
+    ],
+    "title_color": [
+      0.95,
+      0.95,
+      0.95
+    ],
+    "subtitle_color": [
+      0.65,
+      0.65,
+      0.68
+    ],
+    "caption_color": [
+      0.6,
+      0.63,
+      0.67
+    ],
+    "title": "ORBITAL ALTITUDE & SATELLITE AGE",
+    "subtitle": "EFFECTS ON LATENCY & BANDWIDTH",
+    "caption": "",
+    "title_size": 46.0,
+    "subtitle_size": 22.0,
+    "caption_size": 20.0,
+    "font_family": "",
+    "font_stack": [
+      "Arial-BoldMT",
+      "Arial-Bold",
+      "Arial,Bold",
+      "ArialMT",
+      "Arial"
+    ],
+    "font_faux_bold": false,
+    "show_legend": true,
+    "legend_size": 20.0,
+    "show_playhead": true,
+    "playhead_opacity": 35.0,
+    "show_tip_dot": true,
+    "tip_dot_size": 16.0,
+    "dot_reveal_lead": 0.0,
+    "dot_reveal_lag": 0.0,
+    "reveal_from_zero": true,
+    "dot_opacity": 100.0,
+    "max_dot_layers": 400,
+    "bind_to_controls": true
+  },
+  "readout": {
+    "enabled": true,
+    "column": "Launch_Date",
+    "prefix": "LAUNCH YEAR  ",
+    "suffix": "",
+    "decimals": 0,
+    "size": 30.0,
+    "color": [
+      0.95,
+      0.95,
+      0.95
+    ],
+    "corner": "top_right"
+  }
+}
