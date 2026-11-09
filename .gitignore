@@ -3,4 +3,6 @@ dist/
 build/
 .DS_Store
 .env
-.vscode/s
+.vscode/
+__pycache__/
+*.py[cod]
