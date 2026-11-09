@@ -18,7 +18,10 @@ from . import scales as sc
 from .dataset import CATEGORY, DATE, Dataset, NUMERIC
 from .geometry import PathGeometry, Pt, build_path
 from .layout import LegendLayout, pack_legend
-from .spec import (AREA, BAR, CONNECTED_SCATTER, ChartSpec, HBAR, LINE, RGB,
+from .spec import (AREA, BAR, CONNECTED_SCATTER, ChartSpec, DONUT, GROUPED_BAR,
+                   HBAR, LINE, LOLLIPOP, RGB, STACKED_AREA, STACKED_BAR,
+                   STEP_LINE, SORT_DATA, SORT_LABEL, SORT_VALUE_ASC,
+                   D_ALL, D_NAME, D_NAME_VAL, D_PCT, D_VALUE,
                    SCATTER, SeriesSpec, palette_color)
 from .transform import aggregate_groups, apply_transform, sort_rows
 
@@ -54,6 +57,9 @@ class SeriesModel:
     dots: List[DotModel] = field(default_factory=list)
     values: List[Optional[float]] = field(default_factory=list)   # post-transform
     baseline_pixel: float = 0.0
+    # For a stacked area the fill closes against the series below
+    # rather than a flat baseline, so that boundary is kept here.
+    lower_points: List[Pt] = field(default_factory=list)
     safe_name: str = "SERIES"
 
 
@@ -81,6 +87,31 @@ class LegendEntry:
 
 
 @dataclass
+class SegmentModel:
+    """One wedge of a donut or pie, measured as a fraction of the ring.
+
+    `start` and `end` already have the inter-slice gap cut out of them, and
+    the label position is resolved here rather than at draw time, so the
+    preview and the generated script place every wedge and caption alike.
+    """
+    label: str
+    value: float
+    start: float              # 0..1 clockwise from twelve o'clock
+    end: float
+    color: RGB
+    reveal_at: float
+    reveal_span: float
+    value_label: str = ""
+    pct_label: str = ""
+    fraction: float = 0.0     # share of the total, before the gap is cut
+    text: str = ""            # the caption as configured, ready to draw
+    label_x: float = 0.0
+    label_y: float = 0.0
+    label_just: str = "left"  # "left" | "right" | "center"
+    show_label: bool = True
+
+
+@dataclass
 class RenderModel:
     spec: ChartSpec
     ok: bool = True
@@ -96,6 +127,19 @@ class RenderModel:
     legend: List[LegendEntry] = field(default_factory=list)
     size_legend: List[Tuple[str, float]] = field(default_factory=list)
     legend_layout: LegendLayout = field(default_factory=LegendLayout)
+    segments: List[SegmentModel] = field(default_factory=list)
+    donut_cx: float = 0.0
+    donut_cy: float = 0.0
+    # r_outer / r_inner are what the reader sees. radius / thickness are the
+    # stroked-ellipse form the renderers actually draw, derived from the pair:
+    # a stroke of width (outer - inner) centred on a path of radius
+    # (outer + inner) / 2 fills exactly the band between them, and collapses
+    # to a solid pie when inner is 0.
+    donut_r_outer: float = 0.0
+    donut_r_inner: float = 0.0
+    donut_radius: float = 0.0
+    donut_thickness: float = 0.0
+    donut_gap_frac: float = 0.0    # gap between slices, as a fraction of the circle
     readout_values: List[float] = field(default_factory=list)
     readout_labels: List[str] = field(default_factory=list)
     x_scale: Optional[sc.Scale] = None
@@ -197,7 +241,12 @@ def build_model(ds: Dataset, spec: ChartSpec) -> RenderModel:
             m.ok = False
             m.error = "No data loaded."
             return m
-        m = _build_bars(ds, spec, m) if spec.is_bar else _build_points(ds, spec, m)
+        if spec.chart_type == DONUT:
+            m = _build_donut(ds, spec, m)
+        elif spec.is_bar:
+            m = _build_bars(ds, spec, m)
+        else:
+            m = _build_points(ds, spec, m)
         if m.ok:
             _finalize_legend(m)
         return m
@@ -255,6 +304,30 @@ def _build_points(ds: Dataset, spec: ChartSpec, m: RenderModel) -> RenderModel:
         m.ok = False
         m.error = "No usable numeric series."
         return m
+
+    # ---- stacking ------------------------------------------------------
+    # Done before the scales are resolved so the Y axis covers the stacked
+    # totals rather than the tallest single series.
+    # A stacked area accumulates each series on top of the one before, so the
+    # value a series plots is its own value plus everything beneath it.
+    if spec.chart_type == STACKED_AREA and len(resolved) > 1:
+        running = [0.0] * len(order)
+        stacked: List[Tuple[SeriesSpec, List[Optional[float]]]] = []
+        lowers: List[List[Optional[float]]] = []
+        for s_spec, vals in resolved:
+            low = list(running)
+            top: List[Optional[float]] = []
+            for k in range(len(order)):
+                v = vals[k]
+                if v is None:
+                    top.append(None)
+                else:
+                    running[k] += v
+                    top.append(running[k])
+            stacked.append((s_spec, top))
+            lowers.append([x for x in low])
+        resolved = stacked
+        m.stack_lowers = lowers
 
     # ---- scales (resolved exactly once per axis) -----------------------
     scatterish = spec.chart_type in (SCATTER, CONNECTED_SCATTER)
@@ -336,8 +409,15 @@ def _build_points(ds: Dataset, spec: ChartSpec, m: RenderModel) -> RenderModel:
             safe_name=_safe(s.display_label()),
         )
         sm.baseline_pixel = scale_y.px_clamped(0.0)
+        if spec.chart_type == STACKED_AREA:
+            lows = getattr(m, "stack_lowers", None)
+            if lows and si < len(lows):
+                sm.lower_points = [(pts[j][0], scale_y.px(lows[si][k] or 0.0))
+                                   for j, k in enumerate(keep)]
         if spec.chart_type != SCATTER and s.show_line:
-            sm.path = build_path(pts, smooth=s.smooth, arc_mode=spec.arc_mode)
+            path_pts = _step_points(pts) if spec.chart_type == STEP_LINE else pts
+            smooth = False if spec.chart_type == STEP_LINE else s.smooth
+            sm.path = build_path(path_pts, smooth=smooth, arc_mode=spec.arc_mode)
 
         want_dots = s.show_dots or spec.chart_type in (SCATTER, CONNECTED_SCATTER) \
             or (catcol is not None) or (sizecol is not None)
@@ -384,6 +464,22 @@ def _build_points(ds: Dataset, spec: ChartSpec, m: RenderModel) -> RenderModel:
         else:
             m.warnings.append("Readout column is not usable; disabled.")
     return m
+
+
+def _step_points(pts: List[Pt]) -> List[Pt]:
+    """Insert a corner between each pair so the line moves in right angles.
+
+    The result holds the original points at even indices, so the leading edge
+    still passes through every data point at the same Progress it would on a
+    straight line chart.
+    """
+    if len(pts) < 2:
+        return list(pts)
+    out: List[Pt] = [pts[0]]
+    for i in range(1, len(pts)):
+        out.append((pts[i][0], pts[i - 1][1]))   # travel horizontally first
+        out.append(pts[i])
+    return out
 
 
 def _diameter_mapper(sizecol, order, spec: ChartSpec):
@@ -452,10 +548,38 @@ def _build_bars(ds: Dataset, spec: ChartSpec, m: RenderModel) -> RenderModel:
         m.error = "No values to aggregate."
         return m
 
-    pairs.sort(key=lambda p: p[1], reverse=True)
+    # Grouped and stacked bars need one value per (group, series), so the
+    # single-series aggregation above becomes a matrix keyed on the same
+    # ordered labels.
+    multi = spec.chart_type in (GROUPED_BAR, STACKED_BAR) and len(spec.series) > 1
+    series_vals: Dict[str, List[float]] = {}
+    if multi:
+        label_src = gcol if gcol is not None else ds.col(spec.x_column)
+        row_labels = ([label_src.display_at(i) for i in range(ds.n_rows)]
+                      if label_src else [str(i + 1) for i in range(ds.n_rows)])
+        for ss in spec.series:
+            c = ds.col(ss.column)
+            if c is None or not c.numeric:
+                m.warnings.append(f"Series '{ss.column}' is not numeric; skipped.")
+                continue
+            agg = dict(aggregate_groups(row_labels, c.numeric, spec.aggregation))
+            series_vals[ss.column] = agg
+        if not series_vals:
+            m.ok = False
+            m.error = "No usable numeric series for the bars."
+            return m
+        keys = list(dict.fromkeys(lab for lab, _ in pairs))
+        totals = [(k, sum(series_vals[c].get(k, 0.0) for c in series_vals)) for k in keys]
+        pairs = totals
+
     if spec.max_bars > 0 and len(pairs) > spec.max_bars:
+        # trim by size first so the cut always keeps the biggest groups,
+        # then apply whatever display order was asked for
         m.warnings.append(f"Showing top {spec.max_bars} of {len(pairs)} groups.")
-        pairs = pairs[:spec.max_bars]
+        keep = {lab for lab, _ in sorted(pairs, key=lambda p: p[1],
+                                         reverse=True)[:spec.max_bars]}
+        pairs = [(lab, v) for lab, v in pairs if lab in keep]
+    pairs = _sorted_pairs(pairs, spec.slice_sort)
     if spec.chart_type == HBAR:
         pairs = pairs[::-1]
 
@@ -469,11 +593,15 @@ def _build_bars(ds: Dataset, spec: ChartSpec, m: RenderModel) -> RenderModel:
     vdec = axis.decimals if axis.decimals >= 0 else sc.auto_decimals(values)
     cat_colors = {lab: tuple(spec.category.colors.get(lab, s.color)) for lab, _ in pairs}
 
-    if spec.chart_type == BAR:
+    if multi:
+        return _build_multi_bars(spec, m, pairs, series_vals, axis, lo, hi, bstep, vdec)
+
+    if spec.chart_type in (BAR, GROUPED_BAR, STACKED_BAR, LOLLIPOP):
         m.y_scale = sc.make_scale(axis, B, T, lo, hi)
         m.x_scale = sc.Scale(vmin=0, vmax=max(1, n), p0=L, p1=R)
         slot = (R - L) / n
-        w = slot * (1.0 - spec.bar_gap)
+        w = (spec.lollipop_stem if spec.chart_type == LOLLIPOP
+             else slot * (1.0 - spec.bar_gap))
         base = m.y_scale.px(0.0)
         for i, (lab, v) in enumerate(pairs):
             cx = L + slot * (i + 0.5)
@@ -535,3 +663,226 @@ def _finalize_legend(m: RenderModel) -> None:
         base_y=s.comp.height - 60.0,
         label_size=s.style.legend_size,
     )
+
+
+def _build_multi_bars(spec: ChartSpec, m: RenderModel, pairs, series_vals,
+                      axis, lo: float, hi: float, bstep: float,
+                      vdec: int) -> RenderModel:
+    """Grouped or stacked bars, one sub-bar per (group, series).
+
+    Both share the same slot arithmetic; the difference is only whether the
+    sub-bars sit side by side inside the slot or accumulate upward from the
+    baseline.
+    """
+    comp = spec.comp
+    L, R, T, B = comp.plot_left, comp.plot_right, comp.plot_top, comp.plot_bottom
+    stacked = spec.chart_type == STACKED_BAR
+    cols = [ss for ss in spec.series if ss.column in series_vals]
+    k = len(cols)
+    n = len(pairs)
+
+    if stacked:
+        top_total = max((sum(series_vals[c.column].get(lab, 0.0) for c in cols)
+                         for lab, _ in pairs), default=1.0)
+        lo, hi, bstep = sc.resolve_range(axis, 0.0, top_total, zero_base=True, pad=0.0)
+
+    m.y_scale = sc.make_scale(axis, B, T, lo, hi)
+    m.x_scale = sc.Scale(vmin=0, vmax=max(1, n), p0=L, p1=R)
+    slot = (R - L) / n
+    inner = slot * (1.0 - spec.bar_gap)
+    base = m.y_scale.px(0.0)
+
+    for i, (lab, _total) in enumerate(pairs):
+        cx = L + slot * (i + 0.5)
+        at = _bar_reveal_at(i, n, spec)
+        span = _reveal_span(n, spec)
+        running = 0.0
+        for j, ss in enumerate(cols):
+            v = series_vals[ss.column].get(lab, 0.0)
+            if stacked:
+                y0 = m.y_scale.px(running)
+                running += v
+                y1 = m.y_scale.px(running)
+                bx, bw = cx, inner
+                seg_base = y0
+            else:
+                sub = inner / k
+                bx = cx - inner / 2.0 + sub * (j + 0.5)
+                bw = sub
+                y1 = m.y_scale.px(v)
+                seg_base = base
+            last = (j == k - 1)
+            m.bars.append(BarModel(
+                label=lab, value=v, x=bx, y=min(y1, seg_base), width=bw,
+                height=abs(seg_base - y1), color=tuple(ss.color),
+                reveal_at=at, reveal_span=span, base=seg_base,
+                value_label=(sc.format_value(running if stacked else v, vdec,
+                                             axis.thousands_sep)
+                             if (last or not stacked) else "")))
+
+    m.y_ticks = _ticks_for(axis, m.y_scale, False, bstep)
+    m.x_ticks = [TickModel(value=i, pixel=L + slot * (i + 0.5), label=lab)
+                 for i, (lab, _) in enumerate(pairs)]
+    if spec.style.show_legend:
+        for ss in cols:
+            m.legend.append(LegendEntry(label=ss.display_label(), color=tuple(ss.color)))
+    return m
+
+
+def _sorted_pairs(pairs: List[Tuple[str, float]], how: str) -> List[Tuple[str, float]]:
+    """Order aggregated (label, value) pairs. `data` keeps first-seen order."""
+    if how == SORT_VALUE_ASC:
+        return sorted(pairs, key=lambda p: p[1])
+    if how == SORT_LABEL:
+        return sorted(pairs, key=lambda p: str(p[0]).lower())
+    if how == SORT_DATA:
+        return list(pairs)
+    return sorted(pairs, key=lambda p: p[1], reverse=True)
+
+
+def _segment_text(spec: ChartSpec, label: str, value_label: str,
+                  pct_label: str) -> str:
+    """The caption for one wedge, in the configured mode."""
+    mode = spec.donut_label_mode
+    if mode == D_VALUE:
+        return value_label
+    if mode == D_PCT:
+        return pct_label
+    if mode == D_NAME:
+        return label
+    if mode == D_NAME_VAL:
+        return f"{label}  {value_label}"
+    if mode == D_ALL:
+        return f"{label}  {value_label}  ({pct_label})"
+    return f"{label}  {pct_label}"      # D_NAME_PCT
+
+
+def _build_donut(ds: Dataset, spec: ChartSpec, m: RenderModel) -> RenderModel:
+    """A ring of wedges sized by share of total.
+
+    Each wedge is one stroked ellipse trimmed to its span, which is why the
+    generated script can animate the whole thing with nothing but Trim Paths.
+    The ring is specified as an outer and an inner radius; the stroke geometry
+    that both renderers consume falls out of that pair, so inner = 0 is a
+    solid pie rather than a separate code path.
+    """
+    comp = spec.comp
+    L, R, T, B = comp.plot_left, comp.plot_right, comp.plot_top, comp.plot_bottom
+
+    if not spec.series:
+        m.ok = False
+        m.error = "Add a value column for the donut."
+        return m
+    vcol = ds.col(spec.series[0].column)
+    if vcol is None or not vcol.numeric:
+        m.ok = False
+        m.error = "Donut value column is not numeric."
+        return m
+
+    # Slices come from the group column when one is set. Falling back to the
+    # X column is only sensible when that column actually repeats; a per-row
+    # id or a date gives one wedge per row, which is never what was wanted.
+    lcol = ds.col(spec.group_column) if spec.group_column else ds.col(spec.x_column)
+    labels = ([lcol.display_at(i) for i in range(ds.n_rows)] if lcol
+              else [str(i + 1) for i in range(ds.n_rows)])
+    pairs = [(lab, v) for lab, v in aggregate_groups(labels, vcol.numeric,
+                                                     spec.aggregation) if v > 0]
+    if not pairs:
+        m.ok = False
+        m.error = "No positive values to chart."
+        return m
+    if not spec.group_column and len(pairs) > max(12, spec.max_bars):
+        m.warnings.append(
+            f"'{spec.x_column}' has {len(pairs)} distinct values. Set 'Group by' "
+            "to a category column for readable slices.")
+
+    pairs = _sorted_pairs(pairs, spec.slice_sort)
+    other = 0.0
+    n_merged = 0
+    if spec.max_bars > 0 and len(pairs) > spec.max_bars:
+        # 'Largest first' is the only order where truncating keeps the biggest
+        # slices, so rank by value for the cut regardless of display order.
+        keep = {lab for lab, _ in sorted(pairs, key=lambda p: p[1],
+                                         reverse=True)[:spec.max_bars]}
+        head = [(lab, v) for lab, v in pairs if lab in keep]
+        other += sum(v for lab, v in pairs if lab not in keep)
+        n_merged += len(pairs) - len(head)
+        pairs = head
+
+    grand = sum(v for _, v in pairs) + other
+    if spec.donut_label_min_pct <= 0 or grand <= 0:
+        min_share = 0.0
+    else:
+        min_share = spec.donut_label_min_pct / 100.0
+
+    if other > 0:
+        pairs = pairs + [(spec.donut_other_label, other)]
+        m.warnings.append(
+            f"Grouped {n_merged} small slices into '{spec.donut_other_label}'.")
+
+    total = sum(v for _, v in pairs) or 1.0
+    n = len(pairs)
+    m.n_points = n
+
+    m.donut_cx = (L + R) / 2.0
+    m.donut_cy = (T + B) / 2.0
+    half = min(R - L, B - T) / 2.0
+    m.donut_r_outer = max(1.0, half * spec.donut_radius_frac)
+    inner_frac = min(max(spec.donut_inner_frac, 0.0), 0.98)
+    m.donut_r_inner = m.donut_r_outer * inner_frac
+    m.donut_radius = (m.donut_r_outer + m.donut_r_inner) / 2.0
+    m.donut_thickness = m.donut_r_outer - m.donut_r_inner
+
+    # A gap wider than the smallest slice would invert that wedge, so cap it.
+    gap = max(0.0, spec.donut_gap_deg) / 360.0
+    smallest = min((v / total for _, v in pairs), default=1.0)
+    m.donut_gap_frac = min(gap, smallest * 0.6)
+
+    axis = spec.y_axis
+    vdec = axis.decimals if axis.decimals >= 0 else sc.auto_decimals([v for _, v in pairs])
+    inside = spec.donut_label_place == "inside"
+    cursor = 0.0
+    for i, (lab, v) in enumerate(pairs):
+        frac = v / total
+        color = tuple(spec.category.colors.get(lab, palette_color(i)))
+        start = cursor + m.donut_gap_frac / 2.0
+        end = cursor + frac - m.donut_gap_frac / 2.0
+        pct = f"{frac * 100:.1f}%"
+        vlabel = sc.format_value(v, vdec, axis.thousands_sep)
+        seg = SegmentModel(
+            label=lab, value=v, start=start, end=max(start, end), color=color,
+            reveal_at=_reveal_at(i, n, spec), reveal_span=_reveal_span(n, spec),
+            value_label=vlabel, pct_label=pct, fraction=frac,
+            text=_segment_text(spec, lab, vlabel, pct),
+            show_label=spec.donut_show_labels and frac >= min_share)
+        _place_segment_label(m, seg, inside)
+        m.segments.append(seg)
+        cursor += frac
+
+    if spec.style.show_legend:
+        for seg in m.segments:
+            m.legend.append(LegendEntry(label=seg.label, color=seg.color))
+    return m
+
+
+def _place_segment_label(m: RenderModel, seg: SegmentModel, inside: bool) -> None:
+    """Resolve one wedge caption's anchor, once, for both renderers.
+
+    Outside labels sit just beyond the ring and read outward from the wedge.
+    Inside labels are centred on the band; on a solid pie there is no band, so
+    they fall back to two thirds of the way out from the centre.
+    """
+    mid = (seg.start + seg.end) / 2.0
+    ang = mid * 2.0 * math.pi - math.pi / 2.0
+    if inside:
+        if m.donut_r_inner > 1.0:
+            rad = (m.donut_r_outer + m.donut_r_inner) / 2.0
+        else:
+            rad = m.donut_r_outer * 0.66
+        just = "center"
+    else:
+        rad = m.donut_r_outer + 34.0
+        just = "left" if math.cos(ang) >= 0 else "right"
+    seg.label_x = m.donut_cx + math.cos(ang) * rad
+    seg.label_y = m.donut_cy + math.sin(ang) * rad + 8.0
+    seg.label_just = just

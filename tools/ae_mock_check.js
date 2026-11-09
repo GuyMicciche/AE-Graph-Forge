@@ -41,11 +41,15 @@ function makeHost() {
     for (let i = 0; i < this._children.length; i++) {
       if (this._children[i]._name === key) return this._children[i];
     }
-    if (!this._kids[key]) this._kids[key] = new Property(key, this._path);
+    if (!this._kids[key]) {
+      this._kids[key] = new Property(key, this._path);
+      this._kids[key]._parent = this;
+    }
     return this._kids[key];
   };
   Property.prototype.addProperty = function (matchName) {
     const p = new Property(matchName, this._path);
+    p._parent = this;
     p._underEffects = (this._name === 'Effects');
     this._children.push(p);
     return p;
@@ -66,7 +70,7 @@ function makeHost() {
   Property.prototype.setTemporalEaseAtKey = function () {};
   Property.prototype.valueAtTime = function () { return this._value; };
   Object.defineProperty(Property.prototype, 'expression', {
-    set(v) { this._expr = v; installed.push({ path: this._path, expression: v }); },
+    set(v) { this._expr = v; installed.push({ path: this._path, expression: v, prop: this }); },
     get() { return this._expr; },
   });
   Object.defineProperty(Property.prototype, 'value', {
@@ -225,7 +229,7 @@ function check(file) {
   let atZero = 0;
   let atFull = 0;
   let checked = 0;
-  for (const { path: pp, expression } of revealing) {
+  for (const { path: pp, expression, prop } of revealing) {
     let script;
     try { script = new vm.Script(expression); } catch { continue; }
     const read = (prog) => {
@@ -237,6 +241,27 @@ function check(file) {
         return Array.isArray(v) ? Math.min(...v.map(Number)) : Number(v);
       } catch { return NaN; }
     };
+    // A Trim Paths End is "empty" when it equals its own Start, not when it
+    // is zero: a wedge starting at 72% draws nothing while End is also 72%.
+    let baseline = 0;
+    if (/Trim > End$/.test(pp)) {
+      // Use the property object itself, not a path lookup: every donut wedge
+      // produces the same path string, so searching by path would compare a
+      // wedge against the first wedge's Start.
+      const start = prop && prop._parent ? prop._parent.property('Start') : null;
+      if (start) {
+        if (start._expr) {
+          try {
+            baseline = Number(new vm.Script(start._expr).runInContext(
+              vm.createContext(makeExprContext(host.effects, 0)), { timeout: 3000 }));
+          } catch { baseline = 0; }
+        } else if (typeof start._value === 'number') {
+          baseline = start._value;
+        }
+      }
+      if (!Number.isFinite(baseline)) baseline = 0;
+    }
+
     const lo = read(0);
     // The playhead and tip dot deliberately fade out over the last half
     // percent, so "visible by the end" is checked across the tail rather than
@@ -244,13 +269,19 @@ function check(file) {
     const hi = Math.max(read(95), read(99), read(100));
     if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
     checked++;
-    if (lo > 0.01) {
+    if (lo - baseline > 0.01) {
       atZero++;
-      if (problems.length < 40) problems.push(`REVEAL  ${pp}: ${lo.toFixed(3)} at Progress 0, expected 0`);
+      if (problems.length < 40) {
+        problems.push(`REVEAL  ${pp}: ${lo.toFixed(3)} at Progress 0, expected `
+          + `${baseline.toFixed(3)}`);
+      }
     }
-    if (hi <= 0.01) {
+    if (hi - baseline <= 0.01) {
       atFull++;
-      if (problems.length < 40) problems.push(`REVEAL  ${pp}: ${hi.toFixed(3)} at Progress 100, expected > 0`);
+      if (problems.length < 40) {
+        problems.push(`REVEAL  ${pp}: ${hi.toFixed(3)} at Progress 100, expected `
+          + `above ${baseline.toFixed(3)}`);
+      }
     }
   }
 

@@ -47,19 +47,11 @@ def main(argv=None) -> int:
     _dark(app)
     win = MainWindow()
     win.show()
+    # A file passed on the command line -- including one the OS hands us
+    # because the app was launched by dropping a CSV on its icon -- goes
+    # through the same loader the Open button and an in-window drop use.
     if len(argv) > 1:
-        try:
-            from .core.dataset import Dataset
-            win.ds = Dataset.from_csv(argv[1])
-            win.lbl_path.setText(f"{argv[1]}\n{win.ds.n_rows} rows, "
-                                 f"{len(win.ds.columns)} columns")
-            win.btn_auto.setEnabled(True)
-            win._populate_columns()
-            win._fill_table()
-            win.auto_configure()
-            win.tabs.setCurrentIndex(1)
-        except Exception as exc:
-            print(f"Could not open {argv[1]}: {exc}")
+        win.load_csv(argv[1])
     return app.exec()
 
 

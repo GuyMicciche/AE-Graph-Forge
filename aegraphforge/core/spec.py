@@ -25,14 +25,32 @@ SCATTER = "scatter"                      # dots only, sequential reveal
 BAR = "bar"                              # vertical bars, grow on progress
 HBAR = "hbar"                            # horizontal bars
 
+STEP_LINE = "step_line"
+STACKED_AREA = "stacked_area"
+STACKED_BAR = "stacked_bar"
+GROUPED_BAR = "grouped_bar"
+LOLLIPOP = "lollipop"
+DONUT = "donut"
+
 CHART_TYPES = [
     (LINE, "Line / Multi-line"),
+    (STEP_LINE, "Step line"),
     (AREA, "Area"),
+    (STACKED_AREA, "Stacked area"),
     (CONNECTED_SCATTER, "Connected scatter"),
     (SCATTER, "Scatter"),
     (BAR, "Bar (vertical)"),
     (HBAR, "Bar (horizontal)"),
+    (GROUPED_BAR, "Grouped bar"),
+    (STACKED_BAR, "Stacked bar"),
+    (LOLLIPOP, "Lollipop"),
+    (DONUT, "Donut / Pie"),
 ]
+
+# charts driven by the bar/aggregation pipeline rather than the point pipeline
+BAR_LIKE = (BAR, HBAR, GROUPED_BAR, STACKED_BAR, LOLLIPOP)
+# charts that draw one path per series
+PATH_LIKE = (LINE, STEP_LINE, AREA, STACKED_AREA, CONNECTED_SCATTER)
 
 # ---------------------------------------------------------------------------
 # per-series transforms
@@ -53,20 +71,75 @@ TRANSFORMS = [
     (T_INDEX100, "Index to 100"),
 ]
 
-# aggregations used by BAR/HBAR when grouping by a category column
+# aggregations used by the bar/donut pipeline when grouping by a category column
 AGGREGATIONS = [
     ("sum", "Sum"),
     ("mean", "Mean"),
     ("median", "Median"),
-    ("count", "Count"),
+    ("count", "Count (rows)"),
     ("min", "Min"),
     ("max", "Max"),
+]
+
+# ---------------------------------------------------------------------------
+# donut / pie options
+# ---------------------------------------------------------------------------
+D_NAME_PCT = "name_percent"
+D_NAME_VAL = "name_value"
+D_NAME = "name"
+D_PCT = "percent"
+D_VALUE = "value"
+D_ALL = "all"
+
+DONUT_LABEL_MODES = [
+    (D_NAME_PCT, "Name and percent"),
+    (D_NAME_VAL, "Name and value"),
+    (D_NAME, "Name only"),
+    (D_PCT, "Percent only"),
+    (D_VALUE, "Value only"),
+    (D_ALL, "Name, value and percent"),
+]
+
+# presets written before the label modes were split still carry these keys
+_LEGACY_LABEL_MODES = {"both": D_ALL, "percent": D_NAME_PCT}
+
+DONUT_LABEL_PLACES = [
+    ("outside", "Outside the ring"),
+    ("inside", "Inside the slice"),
+]
+
+SORT_VALUE_DESC = "value_desc"
+SORT_VALUE_ASC = "value_asc"
+SORT_DATA = "data"
+SORT_LABEL = "label"
+
+SLICE_SORTS = [
+    (SORT_VALUE_DESC, "Largest first"),
+    (SORT_VALUE_ASC, "Smallest first"),
+    (SORT_DATA, "Data order"),
+    (SORT_LABEL, "Label A-Z"),
 ]
 
 SCALE_LINEAR = "linear"
 SCALE_LOG = "log"
 SCALE_SQRT = "sqrt"
 SCALES = [(SCALE_LINEAR, "Linear"), (SCALE_LOG, "Log10"), (SCALE_SQRT, "Square root")]
+
+
+SCALE_NONE = "none"
+SCALE_AUTO = "auto"
+LABEL_SCALES = [
+    (SCALE_NONE, "None"),
+    (SCALE_AUTO, "Auto"),
+    ("thousands", "Thousands (K)"),
+    ("millions", "Millions (M)"),
+    ("billions", "Billions (B)"),
+]
+_LABEL_SCALE_DIV = {
+    "thousands": (1e3, "K"),
+    "millions": (1e6, "M"),
+    "billions": (1e9, "B"),
+}
 
 
 @dataclass
@@ -84,8 +157,30 @@ class AxisSpec:
     thousands_sep: bool = True
     show_grid: bool = True
     label_size: float = 22.0
+    title_size: float = 22.0
+    unit_size: float = 18.0
+    # Divide tick LABELS by a power of ten so 4,500,000 reads as 4.5. The
+    # underlying values and all plotted geometry are untouched.
+    label_scale: str = SCALE_NONE
+    label_scale_suffix: bool = True     # append K / M / B to each label
     # for the second (right-hand) axis in dual-axis line charts
     enabled: bool = True
+
+    def scale_factor(self, vmax: float = 0.0) -> Tuple[float, str]:
+        """Return (divisor, suffix) for tick labels on this axis."""
+        mode = self.label_scale
+        if mode == SCALE_AUTO:
+            a = abs(vmax)
+            if a >= 1e9:
+                mode = "billions"
+            elif a >= 1e6:
+                mode = "millions"
+            elif a >= 1e4:
+                mode = "thousands"
+            else:
+                return 1.0, ""
+        div, sfx = _LABEL_SCALE_DIV.get(mode, (1.0, ""))
+        return div, (sfx if self.label_scale_suffix else "")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -104,7 +199,7 @@ class SeriesSpec:
     show_dots: bool = False
     dot_size: float = 10.0
     fill_opacity: float = 0.0          # >0 draws an area fill under the line
-    smooth: bool = True                # Catmull-Rom tangents vs straight
+    smooth: bool = False               # Catmull-Rom tangents vs straight
 
     def display_label(self) -> str:
         return self.label or self.column
@@ -269,11 +364,26 @@ class ChartSpec:
     readout: ReadoutSpec = field(default_factory=ReadoutSpec)
     arc_mode: str = "chord"           # "chord" | "bezier"
     bar_gap: float = 0.28             # fraction of slot
+    lollipop_stem: float = 6.0        # stem thickness in pixels
+    lollipop_dot: float = 26.0        # tip dot diameter
+    # The ring is described by an OUTER and an INNER radius, which is what a
+    # reader actually sees. The stroked-ellipse the renderer draws (path radius
+    # + stroke width) is derived from the pair in build.py, so an inner radius
+    # of 0 collapses the hole and gives a solid pie with no special-casing.
+    donut_radius_frac: float = 0.78   # outer radius, of half the shorter plot side
+    donut_inner_frac: float = 0.55    # inner radius, as a fraction of the outer
+    donut_gap_deg: float = 0.0        # gap cut between neighbouring slices
+    donut_show_labels: bool = True
+    donut_label_mode: str = D_NAME_PCT
+    donut_label_place: str = "outside"   # "outside" | "inside"
+    donut_label_min_pct: float = 0.0     # hide labels on slices under this share
+    donut_other_label: str = "Other"
+    slice_sort: str = SORT_VALUE_DESC    # ordering for donut slices and bars
 
     # -- convenience --------------------------------------------------------
     @property
     def is_bar(self) -> bool:
-        return self.chart_type in (BAR, HBAR)
+        return self.chart_type in BAR_LIKE
 
     @property
     def uses_path(self) -> bool:
@@ -297,6 +407,17 @@ class ChartSpec:
             "max_bars": self.max_bars,
             "arc_mode": self.arc_mode,
             "bar_gap": self.bar_gap,
+            "lollipop_stem": self.lollipop_stem,
+            "lollipop_dot": self.lollipop_dot,
+            "donut_radius_frac": self.donut_radius_frac,
+            "donut_inner_frac": self.donut_inner_frac,
+            "donut_gap_deg": self.donut_gap_deg,
+            "donut_show_labels": self.donut_show_labels,
+            "donut_label_mode": self.donut_label_mode,
+            "donut_label_place": self.donut_label_place,
+            "donut_label_min_pct": self.donut_label_min_pct,
+            "donut_other_label": self.donut_other_label,
+            "slice_sort": self.slice_sort,
             "series": [s.to_dict() for s in self.series],
             "x_axis": self.x_axis.to_dict(),
             "y_axis": self.y_axis.to_dict(),
@@ -315,9 +436,14 @@ class ChartSpec:
     def from_dict(cls, d: Dict[str, Any]) -> "ChartSpec":
         spec = cls()
         for key in ("chart_type", "x_column", "sort_column", "sort_ascending",
-                    "group_column", "aggregation", "max_bars", "arc_mode", "bar_gap"):
+                    "group_column", "aggregation", "max_bars", "arc_mode", "bar_gap",
+                    "lollipop_stem", "lollipop_dot", "donut_radius_frac",
+                    "donut_inner_frac", "donut_gap_deg", "donut_show_labels",
+                    "donut_label_mode", "donut_label_place", "donut_label_min_pct",
+                    "donut_other_label", "slice_sort"):
             if key in d:
                 setattr(spec, key, d[key])
+        spec._migrate_legacy(d)
         spec.series = []
         for sd in d.get("series", []):
             s = SeriesSpec()
@@ -342,6 +468,22 @@ class ChartSpec:
                 setattr(obj, k, v)
             setattr(spec, key, obj)
         return spec
+
+    def _migrate_legacy(self, d: Dict[str, Any]) -> None:
+        """Fold pre-inner-radius presets onto the outer/inner pair.
+
+        The old spec described the ring as a path radius plus a stroke
+        thickness, so the visible edges sat at radius*(1 +/- thickness_frac).
+        Converting keeps an old preset looking identical after loading.
+        """
+        if "donut_thickness_frac" in d and "donut_inner_frac" not in d:
+            tf = max(0.0, float(d["donut_thickness_frac"]))
+            r = float(d.get("donut_radius_frac", self.donut_radius_frac))
+            self.donut_radius_frac = r * (1.0 + tf)
+            self.donut_inner_frac = max(0.0, (1.0 - tf) / (1.0 + tf))
+        mode = d.get("donut_label_mode")
+        if mode in _LEGACY_LABEL_MODES:
+            self.donut_label_mode = _LEGACY_LABEL_MODES[mode]
 
     @classmethod
     def from_json(cls, s: str) -> "ChartSpec":

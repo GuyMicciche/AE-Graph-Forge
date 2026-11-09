@@ -22,7 +22,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .build import BarModel, DotModel, RenderModel, SeriesModel
 from .geometry import fmt_list, fmt_num, fmt_pairs, r2, r6
-from .spec import (AREA, BAR, CONNECTED_SCATTER, ChartSpec, HBAR, LINE, RGB,
+from .spec import (AREA, BAR, CONNECTED_SCATTER, ChartSpec, DONUT, GROUPED_BAR,
+                   HBAR, LINE, LOLLIPOP, STACKED_AREA, STACKED_BAR, STEP_LINE, RGB,
                    SCATTER)
 
 IND = "    "
@@ -130,10 +131,13 @@ class JSXGenerator:
         self._data()
         self._helpers()
         self._comp_and_controls()
-        self._grid_and_axes()
+        if s.chart_type != DONUT:
+            self._grid_and_axes()
         self._titles()
         self._legend()
-        if s.is_bar:
+        if s.chart_type == DONUT:
+            self._donut()
+        elif s.is_bar:
             self._bars()
         else:
             self._series()
@@ -163,9 +167,28 @@ class JSXGenerator:
             self.ctrl("dot_opacity", "Dot Opacity")
             self.ctrl("softness", "Reveal Softness")
             self.ctrl("grid_opacity", "Grid Opacity")
+            self.ctrl("grid_width", "Grid Width")
             self.ctrl("labels_opacity", "Labels Opacity")
+            self.ctrl("title_opacity", "Title Opacity")
+            self.ctrl("legend_opacity", "Legend Opacity")
+            if s.chart_type in (AREA, STACKED_AREA) or any(
+                    sm.spec.fill_opacity > 0 for sm in m.series):
+                self.ctrl("area_opacity", "Area Opacity")
+            if s.is_bar:
+                self.ctrl("bar_width", "Bar Width")
+                self.ctrl("bar_round", "Bar Roundness")
+            if s.chart_type == DONUT:
+                # Outer as a percentage of the built size, inner as a
+                # percentage of the outer, so dragging Ring Inner to 0 turns
+                # the donut into a pie without touching anything else.
+                self.ctrl("ring_outer", "Ring Outer")
+                self.ctrl("ring_inner", "Ring Inner")
+                self.ctrl("ring_gap", "Ring Gap")
+            if s.readout.enabled:
+                self.ctrl("readout_opacity", "Readout Opacity")
             if s.style.show_playhead and not s.is_bar:
                 self.ctrl("playhead_opacity", "Playhead Opacity")
+                self.ctrl("playhead_width", "Playhead Width")
             if s.style.show_tip_dot and not s.is_bar:
                 self.ctrl("tip_size", "Tip Size")
             for i, sm in enumerate(m.series):
@@ -176,15 +199,29 @@ class JSXGenerator:
                     self.ctrl(key, f"{le.label} Color")
 
     def _is_category(self, label: str) -> bool:
-        return any(label == d.label for sm in self.m.series for d in sm.dots)
+        """Does this legend entry stand for a group that has its own layers?
+
+        Only those get a colour control, so a plain multi-series legend does
+        not sprout duplicates of the per-series colours. Donut wedges and bar
+        groups qualify: each is a layer whose fill can be rewired live.
+        """
+        if any(label == d.label for sm in self.m.series for d in sm.dots):
+            return True
+        if any(label == g.label for g in self.m.segments):
+            return True
+        return False
 
     # -- header ----------------------------------------------------------
     def _header(self) -> None:
         m, s = self.m, self.s
         stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-        kind = {LINE: "line chart", AREA: "area chart",
+        kind = {LINE: "line chart", AREA: "area chart", STEP_LINE: "step line chart",
+                STACKED_AREA: "stacked area chart",
                 CONNECTED_SCATTER: "connected scatterplot", SCATTER: "scatterplot",
-                BAR: "bar chart", HBAR: "horizontal bar chart"}.get(s.chart_type, "chart")
+                BAR: "bar chart", HBAR: "horizontal bar chart",
+                GROUPED_BAR: "grouped bar chart", STACKED_BAR: "stacked bar chart",
+                LOLLIPOP: "lollipop chart",
+                DONUT: "donut chart"}.get(s.chart_type, "chart")
         title = s.style.title or s.comp.name
         series_txt = ", ".join(sm.label for sm in m.series) or "-"
         self.w("// " + "=" * 71, 0)
@@ -358,9 +395,13 @@ function makeText(str, size, color, pos, justify) {{
     td.fillColor = color;
     setFont(td);
     try {{
-        td.justification = (justify === "left")  ? ParagraphJustification.LEFT_JUSTIFY :
-                           (justify === "right") ? ParagraphJustification.RIGHT_JUSTIFY :
-                                                   ParagraphJustification.CENTER_JUSTIFY;
+        if (justify === "left") {{
+            td.justification = ParagraphJustification.LEFT_JUSTIFY;
+        }} else if (justify === "right") {{
+            td.justification = ParagraphJustification.RIGHT_JUSTIFY;
+        }} else {{
+            td.justification = ParagraphJustification.CENTER_JUSTIFY;
+        }}
     }} catch (e) {{}}
     t.property("Source Text").setValue(td);
     t.property("Transform").property("Position").setValue(pos);
@@ -370,6 +411,7 @@ function makeText(str, size, color, pos, justify) {{
 
 function addHGridline(y, w) {{
     var g = spanLayer(comp.layers.addSolid(GRID_COLOR, "Gridline", Math.max(1, Math.round(w)), {gw}, 1));
+    g.property("Transform").property("Anchor Point").setValue([0, 0]);
     g.property("Transform").property("Position").setValue([PLOT_L + w / 2, y]);
     g.property("Transform").property("Opacity").setValue({fmt_num(s.style.grid_opacity)});
     return g;
@@ -502,6 +544,25 @@ function buildBar(name, w, h, color) {{
     return layer;
 }}
 
+function buildRing(name, radius, thickness, color) {{
+    var layer = spanLayer(comp.layers.addShape());
+    layer.name = name;
+    var group = layer.property("Contents").addProperty("ADBE Vector Group");
+    group.name = "RingGroup";
+    var ellipse = group.property("Contents").addProperty("ADBE Vector Shape - Ellipse");
+    ellipse.name = "RingShape";
+    ellipse.property("Size").setValue([radius * 2, radius * 2]);
+    var stroke = group.property("Contents").addProperty("ADBE Vector Graphic - Stroke");
+    stroke.name = "RingStroke";
+    stroke.property("Color").setValue(color);
+    stroke.property("Stroke Width").setValue(thickness);
+    stroke.property("Line Cap").setValue(1);
+    var trim = group.property("Contents").addProperty("ADBE Vector Filter - Trim");
+    trim.name = "RingTrim";
+    layer.property("Transform").property("Anchor Point").setValue([0, 0]);
+    return layer;
+}}
+
 function easyEase(prop, idx) {{
     var ease = new KeyframeEase(0, {fmt_num(s.comp.ease_influence)});
     prop.setTemporalEaseAtKey(idx, [ease], [ease]);
@@ -535,6 +596,20 @@ function buildPlayhead() {{
 
         st = s.style
         slider("line_weight", 100)
+        slider("grid_width", 100)
+        slider("title_opacity", 100)
+        slider("legend_opacity", 100)
+        slider("readout_opacity", 100)
+        slider("playhead_width", 100)
+        slider("bar_width", 100)
+        slider("bar_round", 0)
+        slider("area_opacity", 100)
+        slider("ring_outer", 100)
+        slider("ring_inner", round(
+            (m.donut_r_inner / m.donut_r_outer * 100.0) if m.donut_r_outer else 0.0, 2))
+        # the configured gap is already cut into SEG_START / SEG_END, so this
+        # slider starts at zero and only adds to it
+        slider("ring_gap", 0)
         slider("dot_scale", 100)
         slider("dot_opacity", st.dot_opacity)
         slider("softness", st.dot_reveal_lead)
@@ -620,21 +695,30 @@ function buildPlayhead() {{
         # configured y-axis title belongs there instead of up the left side.
         bottom_title = s.y_axis.title if s.chart_type == HBAR else s.x_axis.title
         side_title = "" if s.chart_type == HBAR else s.y_axis.title
+        bt_size = (s.y_axis if s.chart_type == HBAR else s.x_axis).title_size
+        st_size = s.y_axis.title_size
         if bottom_title:
-            self.w(f"makeText({jstr(bottom_title)}, 22, AXIS_COLOR, "
+            self.w(f"makeText({jstr(bottom_title)}, {fmt_num(bt_size)}, AXIS_COLOR, "
                    f"[(PLOT_L + PLOT_R) / 2, PLOT_B + 95], \"center\");")
         if side_title:
-            self.w(f"var yTitle = makeText({jstr(side_title)}, 22, AXIS_COLOR, "
-                   f"[PLOT_L - 95, (PLOT_T + PLOT_B) / 2], \"center\");")
+            self.w(f"var yTitle = makeText({jstr(side_title)}, {fmt_num(st_size)}, "
+                   f"AXIS_COLOR, [PLOT_L - 95, (PLOT_T + PLOT_B) / 2], \"center\");")
             self.w('yTitle.property("Transform").property("Rotation").setValue(-90);')
         if m.y2_ticks and s.y2_axis.title:
             self.w(f"var y2Title = makeText({jstr(s.y2_axis.title)}, 22, AXIS_COLOR, "
                    f"[PLOT_R + 95, (PLOT_T + PLOT_B) / 2], \"center\");")
             self.w('y2Title.property("Transform").property("Rotation").setValue(90);')
         if s.y_axis.unit:
-            self.w(f"makeText({jstr(s.y_axis.unit)}, 18, CAP_COLOR, [PLOT_L - 20, PLOT_T - 30], \"right\");")
+            self.w(f"makeText({jstr(s.y_axis.unit)}, {fmt_num(s.y_axis.unit_size)}, "
+                   f"CAP_COLOR, [PLOT_L - 20, PLOT_T - 30], \"right\");")
         if m.y2_ticks and s.y2_axis.unit:
-            self.w(f"makeText({jstr(s.y2_axis.unit)}, 18, CAP_COLOR, [PLOT_R + 20, PLOT_T - 30], \"left\");")
+            self.w(f"makeText({jstr(s.y2_axis.unit)}, {fmt_num(s.y2_axis.unit_size)}, "
+                   f"CAP_COLOR, [PLOT_R + 20, PLOT_T - 30], \"left\");")
+        # The X unit sits just past the right-hand end of the value axis, which
+        # is where a reader looks after scanning the tick labels.
+        if s.x_axis.unit:
+            self.w(f"makeText({jstr(s.x_axis.unit)}, {fmt_num(s.x_axis.unit_size)}, "
+                   f"CAP_COLOR, [PLOT_R + 20, PLOT_B + 45], \"left\");")
 
     def _long_labels(self) -> bool:
         return any(len(t.label) > 6 for t in self.m.x_ticks)
@@ -738,9 +822,17 @@ function buildPlayhead() {{
         s = self.s
         p = sm.path
         base = sm.baseline_pixel
-        verts = list(p.points) + [(p.points[-1][0], base), (p.points[0][0], base)]
-        ins = list(p.in_tangents) + [(0.0, 0.0), (0.0, 0.0)]
-        outs = list(p.out_tangents) + [(0.0, 0.0), (0.0, 0.0)]
+        if sm.lower_points:
+            # A stacked band closes along the top of the series beneath it
+            # rather than along a flat baseline.
+            low = list(reversed(sm.lower_points))
+            verts = list(p.points) + low
+            pad = [(0.0, 0.0)] * len(low)
+        else:
+            verts = list(p.points) + [(p.points[-1][0], base), (p.points[0][0], base)]
+            pad = [(0.0, 0.0), (0.0, 0.0)]
+        ins = list(p.in_tangents) + pad
+        outs = list(p.out_tangents) + pad
         op = sm.spec.fill_opacity if sm.spec.fill_opacity > 0 else 28.0
         self.w(f"var area{i} = buildAreaLayer({jstr(sm.safe_name + '_AREA')}, "
                f"{fmt_pairs(verts, r2)}, {fmt_pairs(ins, r6)}, {fmt_pairs(outs, r6)}, "
@@ -764,6 +856,13 @@ function buildPlayhead() {{
         if color_expr:
             self.w(f'vprop(area{i}, "AreaGroup", "AreaFill")'
                    f'.property("Color").expression = {color_expr};')
+        if "area_opacity" in self._ctrl_names:
+            self.w(f'vprop(area{i}, "AreaGroup", "AreaFill").property("Opacity")'
+                   f'.expression = ' + expr([
+                       CTRL,
+                       f"var base = {fmt_num(op)};",
+                       f'base * {self.read("area_opacity")} / 100;',
+                   ]) + ";")
 
     # -- runtime-assembled expressions ------------------------------------
     def _emit_expr_assign(self, target: str, lines, indent: int = 1) -> None:
@@ -918,6 +1017,12 @@ function buildPlayhead() {{
                 "[x, (PLOT_T + PLOT_B) / 2];".replace("PLOT_T", fmt_num(s.comp.plot_top))
                                              .replace("PLOT_B", fmt_num(s.comp.plot_bottom)),
             ]) + ";")
+            if "playhead_width" in self._ctrl_names:
+                self.w('playhead.property("Transform").property("Scale").expression = ' + expr([
+                    CTRL,
+                    f'var k = {self.read("playhead_width")};',
+                    "[k, 100];",
+                ]) + ";")
             if bind:
                 self.w('playhead.property("Transform").property("Opacity").expression = ' + expr([
                     CTRL, PROG,
@@ -1003,6 +1108,21 @@ function buildPlayhead() {{
             grow,
         ], indent=2)
 
+        if "bar_round" in self._ctrl_names:
+            self.w('vprop(bar, "Bar", "BarRect").property("Roundness").expression = '
+                   + expr([CTRL, f'{self.read("bar_round")};']) + ";", 2)
+        if "bar_width" in self._ctrl_names:
+            # BAR_W/BAR_H are script-scope arrays and an expression cannot see
+            # them, so the two numbers are concatenated into the expression
+            # text as the loop writes it.
+            self._emit_expr_assign('vprop(bar, "Bar", "BarRect").property("Size")', [
+                'var ctrl = thisComp.layer("MASTER_CONTROLS");',
+                f'var k = ctrl.effect("{self._ctrl_names["bar_width"]}")("Slider") / 100;',
+                ["var w = ", "~BAR_W[b]", ";"],
+                ["var h = ", "~BAR_H[b]", ";"],
+                ("[w, h * k];" if horiz else "[w * k, h];"),
+            ], indent=2)
+
         self.w("")
         self.w("// value label riding the end of each bar", 2)
         if horiz:
@@ -1020,6 +1140,130 @@ function buildPlayhead() {{
             "linear(progress, lo, Math.max(lo + 0.001, at), 0, 100);",
         ], indent=2)
         self.w("}", 1)
+
+        if s.chart_type == LOLLIPOP:
+            self.w("")
+            self.w("// lollipop heads, revealed with their stems")
+            self.w("for (var q = 0; q < BAR_X.length; q++) {", 1)
+            self.w(f'var head = buildDot("HEAD_" + q, {fmt_num(s.lollipop_dot)}, '
+                   "BAR_COLORS[BAR_CIDX[q]]);", 2)
+            self.w('head.property("Transform").property("Position")'
+                   '.setValue([BAR_X[q], BAR_Y[q]]);', 2)
+            self._emit_expr_assign('head.property("Transform").property("Scale")', [
+                'var ctrl = thisComp.layer("MASTER_CONTROLS");',
+                f'var progress = ctrl.effect("{self._ctrl_names["progress"]}")("Slider");',
+                ["var at = ", "~BAR_AT[q]", ";"],
+                f"var span = {fmt_num(round(bspan, 6))};",
+                "var lo = Math.max(0, at - span);",
+                "var g = ease(progress, lo, Math.max(lo + 0.001, at), 0, 100);",
+                "[g, g];",
+            ], indent=2)
+            self.w("}", 1)
+
+    # -- donut -----------------------------------------------------------
+    def _donut(self) -> None:
+        """Each wedge is one stroked ellipse trimmed to its own span.
+
+        Trim Paths measures around the ellipse from twelve o'clock clockwise,
+        which is exactly the coordinate a pie chart wants, so the sweep needs
+        no path maths at all.
+
+        The ring is described by an outer and an inner radius. A stroke of
+        width (outer - inner) centred on a path of radius (outer + inner) / 2
+        fills precisely that band, and when the inner radius is 0 the stroke
+        reaches the centre, so a pie is the same layer setup as a donut with
+        one slider moved. Both radii are bound to MASTER_CONTROLS, so the ring
+        can be reshaped in After Effects without regenerating the script.
+        """
+        m, s = self.m, self.s
+        self.section("DONUT SEGMENTS")
+        self.w(f"var RING_CX = {fmt_num(r2(m.donut_cx))};")
+        self.w(f"var RING_CY = {fmt_num(r2(m.donut_cy))};")
+        self.w(f"var RING_OUTER = {fmt_num(r2(m.donut_r_outer))};")
+        self.w(f"var RING_INNER = {fmt_num(r2(m.donut_r_inner))};")
+        self.w("var RING_R = (RING_OUTER + RING_INNER) / 2;")
+        self.w("var RING_W = RING_OUTER - RING_INNER;")
+        self.w("var SEG_START = " + fmt_list([g.start * 100 for g in m.segments], r2) + ";")
+        self.w("var SEG_END = " + fmt_list([g.end * 100 for g in m.segments], r2) + ";")
+        self.w("var SEG_AT = " + fmt_list([g.reveal_at for g in m.segments], r2) + ";")
+        self.w("var SEG_COLORS = [" + ", ".join(jcolor(g.color) for g in m.segments) + "];")
+        self.w("var SEG_CTRL = [" + ", ".join(
+            jstr(self._ctrl_names.get(f"cat_color_{g.label}", "")) for g in m.segments) + "];")
+        span = m.segments[0].reveal_span if m.segments else 0.0
+        bound = "ring_outer" in self._ctrl_names
+        # Size and stroke width both need the same two numbers, so the
+        # prologue that reads the sliders is written once and shared.
+        geom = [
+            CTRL,
+            f"var ro = {fmt_num(r2(m.donut_r_outer))} * {self.read('ring_outer')} / 100;",
+            f"var ri = ro * {self.read('ring_inner')} / 100;",
+        ] if bound else []
+        self.w("")
+        self.w("for (var g = 0; g < SEG_START.length; g++) {", 1)
+        self.w('var seg = buildRing("SEG_" + g, RING_R, RING_W, SEG_COLORS[g]);', 2)
+        self.w('seg.property("Transform").property("Position")'
+               ".setValue([RING_CX, RING_CY]);", 2)
+        if bound:
+            self.w('vprop(seg, "RingGroup", "RingShape").property("Size")'
+                   ".expression = " + expr(geom + [
+                       "var d = ro + ri;",
+                       "[d, d];",
+                   ]) + ";", 2)
+            self.w('vprop(seg, "RingGroup", "RingStroke").property("Stroke Width")'
+                   ".expression = " + expr(geom + [
+                       "Math.max(0, ro - ri);",
+                   ]) + ";", 2)
+            self.w("if (SEG_CTRL[g] !== \"\") {", 2)
+            self._emit_expr_assign(
+                'vprop(seg, "RingGroup", "RingStroke").property("Color")', [
+                    CTRL,
+                    ['ctrl.effect("', "~SEG_CTRL[g]", '")("Color");'],
+                ], indent=3)
+            self.w("}", 2)
+        gap = (f'var gap = {self.read("ring_gap")} * 0.1;' if "ring_gap" in self._ctrl_names
+               else "var gap = 0;")
+        self._emit_expr_assign('vprop(seg, "RingGroup", "RingTrim").property("Start")', [
+            'var ctrl = thisComp.layer("MASTER_CONTROLS");',
+            gap,
+            ["var a = ", "~SEG_START[g]", ";"],
+            "a + gap;",
+        ], indent=2)
+        self._emit_expr_assign('vprop(seg, "RingGroup", "RingTrim").property("End")', [
+            'var ctrl = thisComp.layer("MASTER_CONTROLS");',
+            f'var progress = ctrl.effect("{self._ctrl_names["progress"]}")("Slider");',
+            gap,
+            ["var a = ", "~SEG_START[g]", ";"],
+            ["var b = ", "~SEG_END[g]", ";"],
+            ["var at = ", "~SEG_AT[g]", ";"],
+            f"var span = {fmt_num(round(span, 6))};",
+            "var hi = Math.max(at + span, at + 0.001);",
+            "a + gap + ease(progress, at, hi, 0, Math.max(0, b - a - gap));",
+        ], indent=2)
+        self.w("}", 1)
+
+        if s.donut_show_labels:
+            self._donut_labels()
+
+    def _donut_labels(self) -> None:
+        """Slice captions. Text and anchor both come straight off the model,
+        so the script cannot disagree with the previewer about either."""
+        m, s = self.m, self.s
+        shown = [g for g in m.segments if g.show_label]
+        if not shown:
+            return
+        self.w("")
+        self.w("// slice labels, placed at each wedge midpoint")
+        span = m.segments[0].reveal_span if m.segments else 0.0
+        for i, g in enumerate(shown):
+            self.w(f"var slab{i} = makeText({jstr(g.text)}, {fmt_num(s.style.legend_size)}, "
+                   f"AXIS_COLOR, [{fmt_num(r2(g.label_x))}, {fmt_num(r2(g.label_y))}], "
+                   f"{jstr(g.label_just)});")
+            self.w(f'slab{i}.property("Transform").property("Opacity").expression = ' + expr([
+                CTRL, PROG,
+                f"var at = {fmt_num(g.reveal_at)};",
+                f"var span = {fmt_num(round(span, 6))};",
+                "linear(progress, at, Math.max(at + span, at + 0.001), 0, 100);",
+            ]) + ";")
 
     # -- readout ---------------------------------------------------------
     def _readout(self) -> None:

@@ -54,14 +54,28 @@ control name that does not match what was actually created.
 
 1. **Data** tab. Load the CSV. Each column is typed automatically as numeric,
    date, category, or text. Check the inferred types here before mapping.
+
+   Files can also be **dropped anywhere on the window**, or passed on the
+   command line. Drop a `.csv`, `.tsv` or `.txt` to load data, a `.json` to
+   apply a saved preset, or both at once to load the data and map it in one
+   go. Dropping a file whose columns match the one already open keeps your
+   current chart rather than auto-configuring a new one, so refreshing a
+   dataset in place does not cost you the mapping.
 2. **Mapping** tab. Choose the chart type, the X column, one or more Y series,
    and the sort column that defines reveal order. Optionally set a category
    column (drives colour), a size column (drives dot area), and a readout
    column (drives the live numeric display).
 3. **Axes** tab. Min, max, and tick step are auto-populated from the data and
    pre-filled into the manual fields, so you can nudge a bound without typing
-   the whole range. Linear, log, and sqrt scales; per-axis decimals and
-   thousands separators.
+   the whole range. Linear, log, and sqrt scales; per-axis decimals, thousands
+   separators, title size, unit, and unit size.
+
+   **Shorten labels** divides tick text by a power of ten so a crowded axis
+   reads cleanly: 4,500,000 becomes `4.5M`, 40,000 becomes `40K`. Auto picks
+   the magnitude from the data, or force thousands, millions, or billions. The
+   K/M/B suffix is optional, so you can drop it and put "millions" in the unit
+   field instead. This is cosmetic only. Plotted geometry, axis ranges, and
+   the live readout all keep working in the raw units.
 4. **Style** tab. Colours, fonts, sizes, legend, gridlines, playhead, tip dot.
 5. **Comp & Animation** tab. Comp name, resolution, frame rate, duration, plot
    rectangle, and the start and end times of the Progress keyframes.
@@ -77,19 +91,65 @@ datasets with the same column names.
 
 ## Chart types
 
+Twelve types, in two families. The first five plot a value against a
+continuous X; the rest aggregate rows into groups first.
+
 | Type | Notes |
 |---|---|
 | `line` | One or many series. Any series can be sent to a right-hand axis. |
+| `step_line` | Right-angled steps. The leading edge still crosses each data point at the same Progress a straight line would. |
 | `area` | Line plus a fill revealed by a Linear Wipe locked to the leading edge. |
+| `stacked_area` | Series accumulate. Each band closes on the one beneath rather than on a flat baseline, and the Y axis covers the stacked totals. |
 | `connected_scatter` | Dots joined in sort order. Size and colour encodings apply. |
 | `scatter` | Dots only, no path. |
 | `bar` | Vertical. Groups and aggregates by a category column. |
 | `hbar` | Horizontal. Same aggregation, value labels ride the bar ends. |
+| `grouped_bar` | One sub-bar per series, side by side inside each slot. |
+| `stacked_bar` | One sub-bar per series, accumulating upward. The total labels the top. |
+| `lollipop` | Thin stem with a head at the value. Reads better than a bar when the bars would all be nearly full width. |
+| `donut` | Wedges sized by share of total. Small slices past the cap merge into an Other slice. Inner radius 0 makes it a pie. |
+
+The donut is worth a note: each wedge is a single stroked ellipse trimmed to
+its own span, so the whole sweep animates on Trim Paths with no arc geometry
+at all.
+
+The ring is specified the way you look at it, as an **outer radius** and an
+**inner radius**. The stroke the renderer actually draws falls out of the
+pair: width `outer - inner`, centred on a path of radius `(outer + inner) / 2`.
+That band is exactly the ring, and at an inner radius of 0 the stroke reaches
+the centre, so a pie is a donut with one slider moved rather than a separate
+code path. Both radii are bound to MASTER_CONTROLS, so the shape can be
+reworked in After Effects without regenerating.
+
+Slices can also carry a gap between them, measured in degrees and capped so it
+can never invert the smallest wedge. Labels can read outside the ring or sit
+inside the band, in any of six name/value/percent combinations, and a minimum
+share threshold suppresses the labels on a long tail of thin slices.
+
+### Grouping
+
+Every bar type, the lollipop and the donut aggregate rows into groups before
+anything is drawn. **Group by** picks the column whose values become the bars
+or slices, **Aggregate** says how rows sharing a value are combined, and
+**Order** sets the display order. The cap on group count always keeps the
+largest groups whatever order they are shown in; on a donut the remainder
+merges into an Other slice.
+
+For a share-of-fleet chart, group by a category column and aggregate with
+`count`: `Orbit_Type` with `count` gives one wedge per orbit carrying its share
+of the satellites, rather than one wedge per row.
+
+Each group gets its own colour swatch in the Mapping tab. The list is taken
+from the chart that was just built, so it matches what is on screen exactly,
+including the merged Other slice, and every swatch becomes a Color control on
+MASTER_CONTROLS.
 
 **Series transforms:** none, cumulative sum, cumulative max, rolling mean,
 rolling sum, index to 100.
 
-**Bar aggregations:** sum, mean, median, count, min, max.
+**Aggregations:** sum, mean, median, count, min, max.
+
+**Slice / bar order:** largest first, smallest first, data order, label A-Z.
 
 ---
 
@@ -99,14 +159,24 @@ The reference scripts expose a single Progress slider. This generator keeps
 that as the animation driver but adds art direction on top, so the look stays
 adjustable after the build without regenerating anything.
 
-The null carries:
+Controls are added only where they apply, so a donut does not get a Line
+Weight slider. Across all chart types the rig can carry:
 
 - **Progress** the master driver, keyframed 0 to 100
 - **Line Weight**, **Dot Scale**, **Dot Opacity**, **Tip Size**
 - **Reveal Softness** how far ahead of the playhead points fade in
-- **Grid Opacity**, **Labels Opacity**, **Playhead Opacity**
+- **Grid Opacity**, **Grid Width**
+- **Labels Opacity**, **Title Opacity**, **Legend Opacity**, **Readout Opacity**
+- **Playhead Opacity**, **Playhead Width**
+- **Area Opacity** on area and stacked area charts
+- **Bar Width**, **Bar Roundness** on the bar family
+- **Ring Outer**, **Ring Inner**, **Ring Gap** on donuts. Ring Outer is a
+  percentage of the built radius and Ring Inner a percentage of the outer, so
+  dragging Ring Inner to 0 collapses a donut into a pie live
 - one **Color** control per series
-- one **Color** control per category level
+- one **Color** control per category level or donut slice
+
+That is up to twenty controls on one null.
 
 Every layer reads from it by expression. Change the LEO colour on the null and
 every LEO dot, its legend swatch, and any line bound to it all follow.
@@ -133,6 +203,9 @@ If a font still refuses to apply, put its exact PostScript name in the second
 field and it goes to the front of that list. In After Effects you can read the
 correct name from the Character panel tooltip, or from
 `app.fonts.allFonts[i].postScriptName` in the ExtendScript console.
+
+The preview uses the same setting, trimming the weight suffix because Qt
+matches on family name where After Effects matches on PostScript name.
 
 ---
 
@@ -211,6 +284,27 @@ Dates become decimal years as `year + (day_of_year - 1) / days_in_year`, so
 - Series 1 `Latency_ms`, transform `rolling_mean`, left axis
 - Series 2 `Bandwidth_Mbps`, transform `rolling_mean`, right axis
 - Category `Orbit_Type` for dots (this is the difference between 4 and 6)
+
+**Two of the new types, from the CLI**
+
+```bash
+# share of capacity by orbit class, as a donut
+python forge_cli.py build data.csv -o SAT_Capacity_Share.jsx \
+    --type donut --group-by Orbit_Type --y Bandwidth_Mbps \
+    --title "CAPACITY BY ORBIT CLASS"
+
+# share of the fleet by count, as a solid pie with a gap between slices
+python forge_cli.py build data.csv -o SAT_Fleet_Share.jsx \
+    --type donut --group-by Orbit_Type --agg count --y Altitude_km \
+    --inner-radius 0 --slice-gap 2 --title "SHARE OF FLEET"
+
+# mean altitude per class, as a lollipop
+python forge_cli.py build data.csv -o SAT_Altitude_Ranking.jsx \
+    --type lollipop --group-by Orbit_Type --agg mean --y Altitude_km
+```
+
+`--group-by` is what makes these readable. Without it the slices fall back to
+the X column, and an X like `Launch_Date` gives one wedge per row.
 
 Or straight from the CLI:
 
@@ -422,17 +516,33 @@ already declared.
   build script declared.
 - The legend wraps to a second row when it runs past the plot rectangle. If it
   still crowds, widen the plot rect or shorten the labels.
-- Stacked bars, small multiples, and error bars are not implemented.
-- Bar charts do not draw a path, so the playhead and tip dot are skipped.
+- Small multiples and error bars are not implemented.
+- Every control carries a tooltip explaining what it does and, where it
+  matters, which choice is the honest one.
+- Bar and donut charts do not draw a path, so the playhead and tip dot are
+  skipped. A donut also has no cartesian axes, so gridlines and tick labels
+  are skipped for it.
 
 ## Verification status
 
 Reproduced against the reference scripts to zero error on tangents and arc
-fractions. All six chart types generate scripts that parse as JavaScript and
+fractions. All chart types generate scripts that parse as JavaScript and
 pass the mock AE host, which checks three things: every expression evaluates
 cleanly across the Progress sweep, nothing is drawn at Progress 0, and every
 path layer has matching anchor and position on both the layer and its vector
 group.
+
+Three checkers live in `tools/`, and all of them pass:
+
+```bash
+python tools/check_donut.py           # donut geometry, labels, ordering, presets
+python tools/check_ui.py              # drag and drop and the mapping panels
+node   tools/ae_mock_check.js *.jsx   # generated scripts against a mock AE host
+```
+
+`check_ui.py` builds a real main window under Qt's offscreen platform plugin
+and drives it with synthetic drag and drop events, so the widget wiring is
+exercised rather than just the model beneath it.
 
 The generated scripts have **not** been executed inside a real After Effects
 install, so give the first export a look before committing to a batch.

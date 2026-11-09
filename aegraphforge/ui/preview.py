@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (QCheckBox, QPushButton, QHBoxLayout, QLabel, QSli
 
 from ..core.build import RenderModel
 from ..core.geometry import PathGeometry
-from ..core.spec import AREA, BAR, CONNECTED_SCATTER, HBAR, SCATTER
+from ..core.spec import (AREA, BAR, CONNECTED_SCATTER, DONUT, HBAR, LOLLIPOP,
+                         SCATTER, STACKED_AREA)
 
 
 def qc(rgb, alpha: float = 1.0) -> QColor:
@@ -115,13 +116,16 @@ class ChartCanvas(QWidget):
         st = m.spec.style
         p.fillRect(QRectF(0, 0, cw, ch), qc(st.bg_color))
 
-        self._grid(p, m)
-        if m.spec.is_bar:
-            self._bars(p, m)
+        if m.spec.chart_type == DONUT:
+            self._donut(p, m)
         else:
-            self._series(p, m)
-            self._playhead(p, m)
-        self._labels(p, m)
+            self._grid(p, m)
+            if m.spec.is_bar:
+                self._bars(p, m)
+            else:
+                self._series(p, m)
+                self._playhead(p, m)
+            self._labels(p, m)
         self._titles(p, m)
         self._legend(p, m)
         self._readout(p, m)
@@ -205,12 +209,23 @@ class ChartCanvas(QWidget):
                 frac = g.trim_at_progress(prog) / 100.0
 
                 # area fill, wiped to the leading edge like the Linear Wipe does
-                if m.spec.chart_type == AREA or sm.spec.fill_opacity > 0:
+                if m.spec.chart_type in (AREA, STACKED_AREA) or sm.spec.fill_opacity > 0:
                     tip = g.point_at_progress(prog)
                     fill = QPainterPath(self._trimmed(qp, frac))
                     if fill.elementCount() > 1:
-                        fill.lineTo(QPointF(tip[0], sm.baseline_pixel))
-                        fill.lineTo(QPointF(g.points[0][0], sm.baseline_pixel))
+                        if sm.lower_points:
+                            # A stacked band closes along the series beneath it,
+                            # walked backwards to the wipe edge.
+                            low = [pt for pt in sm.lower_points if pt[0] <= tip[0]]
+                            if low:
+                                fill.lineTo(QPointF(tip[0], low[-1][1]))
+                                for pt in reversed(low):
+                                    fill.lineTo(QPointF(pt[0], pt[1]))
+                            else:
+                                fill.lineTo(QPointF(tip[0], sm.baseline_pixel))
+                        else:
+                            fill.lineTo(QPointF(tip[0], sm.baseline_pixel))
+                            fill.lineTo(QPointF(g.points[0][0], sm.baseline_pixel))
                         fill.closeSubpath()
                         op = (sm.spec.fill_opacity or 28.0) / 100.0
                         p.setPen(Qt.NoPen)
@@ -292,7 +307,15 @@ class ChartCanvas(QWidget):
             p.drawRect(rect)
 
             llo = max(0.0, b.reveal_at - b.reveal_span)
-            la = self._ramp(prog, llo, max(llo + 0.001, b.reveal_at))
+            if m.spec.chart_type == LOLLIPOP:
+                r = m.spec.lollipop_dot / 2.0 * t
+                if r > 0.2:
+                    p.setBrush(qc(b.color))
+                    cy = b.y if b.y < b.base else b.y + b.height
+                    p.drawEllipse(QPointF(b.x, cy), r, r)
+
+            llo2 = llo
+            la = self._ramp(prog, llo2, max(llo2 + 0.001, b.reveal_at))
             if la > 0.01:
                 self._text(p, b.value_label or b.label, 20,
                            qc(m.spec.style.axis_text_color, la),
@@ -318,9 +341,70 @@ class ChartCanvas(QWidget):
         p.drawText(QPointF(dx, 0), s)
         p.restore()
 
-    @staticmethod
-    def _family() -> str:
-        return "Arial"
+    def _family(self) -> str:
+        """Family name for the preview.
+
+        The spec stores what After Effects wants, a PostScript name like
+        "Futura-Bold". Qt matches on family, so the weight suffix is trimmed
+        off before asking for the font.
+        """
+        m = self.model
+        fam = (m.spec.style.font_family if m is not None and m.spec else "") or ""
+        fam = fam.strip()
+        if not fam:
+            return "Arial"
+        for suffix in ("-BoldMT", "-BoldItalicMT", "-Bold", "-Regular", "-Medium",
+                       "-Italic", "-Light", "-Black", "-Semibold", "MT"):
+            if fam.endswith(suffix):
+                fam = fam[: -len(suffix)]
+                break
+        fam = fam.split(",")[0].strip()
+        return fam or "Arial"
+
+    def _donut(self, p: QPainter, m: RenderModel) -> None:
+        """Wedges drawn as stroked arcs, matching the Trim Paths sweep in AE.
+
+        The band between the inner and outer radius is painted as a stroke of
+        width (outer - inner) centred on a path halfway between them, which is
+        exactly what the generated script builds. With inner at 0 the stroke
+        reaches the centre and the ring reads as a solid pie.
+        """
+        st = m.spec.style
+        prog = self.progress
+        if m.donut_thickness <= 0:
+            return
+        rect = QRectF(m.donut_cx - m.donut_radius, m.donut_cy - m.donut_radius,
+                      m.donut_radius * 2, m.donut_radius * 2)
+        for seg in m.segments:
+            lo = seg.reveal_at
+            hi = max(lo + 0.001, seg.reveal_at + seg.reveal_span)
+            t = self._ramp(prog, lo, hi)
+            t = t * t * (3 - 2 * t)                     # ease(), as in the script
+            if t <= 0.001:
+                continue
+            pen = QPen(qc(seg.color))
+            pen.setWidthF(m.donut_thickness)
+            pen.setCapStyle(Qt.FlatCap)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            # Qt angles run counter-clockwise from three o'clock in 1/16 degree
+            # units; AE trims clockwise from twelve, hence the negation.
+            start_deg = 90.0 - seg.start * 360.0
+            span_deg = -(seg.end - seg.start) * 360.0 * t
+            p.drawArc(rect, int(round(start_deg * 16)), int(round(span_deg * 16)))
+
+        if not m.spec.donut_show_labels:
+            return
+        for seg in m.segments:
+            if not seg.show_label:
+                continue
+            lo = seg.reveal_at
+            hi = max(lo + 0.001, seg.reveal_at + seg.reveal_span)
+            a = self._ramp(prog, lo, hi)
+            if a <= 0.01:
+                continue
+            self._text(p, seg.text, st.legend_size, qc(st.axis_text_color, a),
+                       (seg.label_x, seg.label_y), seg.label_just)
 
     def _labels(self, p: QPainter, m: RenderModel) -> None:
         st = m.spec.style
@@ -341,18 +425,25 @@ class ChartCanvas(QWidget):
         bottom_title = (m.spec.y_axis.title if m.spec.chart_type == HBAR
                         else m.spec.x_axis.title)
         side_title = "" if m.spec.chart_type == HBAR else m.spec.y_axis.title
+        bt_size = (m.spec.y_axis if m.spec.chart_type == HBAR
+                   else m.spec.x_axis).title_size
         if bottom_title:
-            self._text(p, bottom_title, 22, col, ((L + R) / 2, B + 95), "center")
+            self._text(p, bottom_title, bt_size, col, ((L + R) / 2, B + 95), "center")
         if side_title:
-            self._text(p, side_title, 22, col, (L - 95, (T + B) / 2), "center",
-                       rotation=-90)
+            self._text(p, side_title, m.spec.y_axis.title_size, col,
+                       (L - 95, (T + B) / 2), "center", rotation=-90)
         if m.y2_ticks and m.spec.y2_axis.title:
             self._text(p, m.spec.y2_axis.title, 22, col, (R + 95, (T + B) / 2), "center",
                        rotation=90)
         if m.spec.y_axis.unit:
-            self._text(p, m.spec.y_axis.unit, 18, qc(st.caption_color), (L - 20, T - 30), "right")
+            self._text(p, m.spec.y_axis.unit, m.spec.y_axis.unit_size,
+                       qc(st.caption_color), (L - 20, T - 30), "right")
         if m.y2_ticks and m.spec.y2_axis.unit:
-            self._text(p, m.spec.y2_axis.unit, 18, qc(st.caption_color), (R + 20, T - 30), "left")
+            self._text(p, m.spec.y2_axis.unit, m.spec.y2_axis.unit_size,
+                       qc(st.caption_color), (R + 20, T - 30), "left")
+        if m.spec.x_axis.unit:
+            self._text(p, m.spec.x_axis.unit, m.spec.x_axis.unit_size,
+                       qc(st.caption_color), (R + 20, B + 45), "left")
 
     def _titles(self, p: QPainter, m: RenderModel) -> None:
         st = m.spec.style

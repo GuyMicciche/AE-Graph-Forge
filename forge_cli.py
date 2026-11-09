@@ -30,8 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aegraphforge.core.build import build_model
 from aegraphforge.core.dataset import CATEGORY, Dataset
 from aegraphforge.core.jsxgen import generate_jsx
-from aegraphforge.core.spec import (CHART_TYPES, CategorySpec, ChartSpec,
-                                    ReadoutSpec, SeriesSpec, SizeSpec,
+from aegraphforge.core.spec import (AGGREGATIONS, CHART_TYPES, CategorySpec,
+                                    ChartSpec, DONUT_LABEL_MODES, ReadoutSpec,
+                                    SLICE_SORTS, SeriesSpec, SizeSpec,
                                     TRANSFORMS, palette_color)
 
 
@@ -59,6 +60,26 @@ def cmd_build(args) -> int:
         spec.x_column = args.x
     if args.sort:
         spec.sort_column = args.sort
+    # grouping, shared by every bar type, the lollipop and the donut
+    if args.group_by:
+        spec.group_column = args.group_by
+    if args.agg:
+        spec.aggregation = args.agg
+    if args.order:
+        spec.slice_sort = args.order
+    if args.max_groups is not None:
+        spec.max_bars = args.max_groups
+    # donut / pie ring shape. Inner radius 0 gives a solid pie.
+    if args.outer_radius is not None:
+        spec.donut_radius_frac = args.outer_radius / 100.0
+    if args.inner_radius is not None:
+        spec.donut_inner_frac = args.inner_radius / 100.0
+    if args.slice_gap is not None:
+        spec.donut_gap_deg = args.slice_gap
+    if args.slice_labels:
+        spec.donut_label_mode = args.slice_labels
+    if args.no_slice_labels:
+        spec.donut_show_labels = False
     if args.y:
         spec.series = []
         for i, name in enumerate(args.y):
@@ -144,6 +165,27 @@ def main(argv=None) -> int:
                          f"({', '.join(k for k, _ in TRANSFORMS)})")
     pb.add_argument("--right", nargs="+", help="Y columns to place on the right axis")
     pb.add_argument("--sort", help="column defining the reveal order")
+    pb.add_argument("--group-by",
+                    help="column whose values become the bars or slices; rows "
+                         "sharing a value are combined with --agg")
+    pb.add_argument("--agg", choices=[k for k, _ in AGGREGATIONS],
+                    help="how rows in a group are combined (default sum). "
+                         "'count' counts rows and ignores the value column")
+    pb.add_argument("--order", choices=[k for k, _ in SLICE_SORTS],
+                    help="display order for the groups (default value_desc)")
+    pb.add_argument("--max-groups", type=int,
+                    help="cap on groups drawn; the rest merge into Other on a "
+                         "donut. 0 for no cap")
+    pb.add_argument("--outer-radius", type=float, metavar="PCT",
+                    help="donut outer radius, %% of half the shorter plot side")
+    pb.add_argument("--inner-radius", type=float, metavar="PCT",
+                    help="donut inner radius, %% of the outer. 0 for a solid pie")
+    pb.add_argument("--slice-gap", type=float, metavar="DEG",
+                    help="gap cut between neighbouring slices, in degrees")
+    pb.add_argument("--slice-labels", choices=[k for k, _ in DONUT_LABEL_MODES],
+                    help="what each slice label says")
+    pb.add_argument("--no-slice-labels", action="store_true",
+                    help="draw the ring without any slice labels")
     pb.add_argument("--color-by")
     pb.add_argument("--size-by")
     pb.add_argument("--readout")

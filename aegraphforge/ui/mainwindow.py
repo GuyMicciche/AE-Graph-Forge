@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import traceback
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QAction, QFont, QGuiApplication, QKeySequence
@@ -27,15 +27,38 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
 from ..core.build import build_model
 from ..core.dataset import CATEGORY, DATE, Dataset, NUMERIC
 from ..core.jsxgen import generate_jsx
-from ..core.spec import (AGGREGATIONS, AREA, BAR, CHART_TYPES,
-                         CONNECTED_SCATTER, CategorySpec, ChartSpec, HBAR,
-                         LINE, SCALES, SCATTER, SeriesSpec, TRANSFORMS,
-                         palette_color)
+from ..core.spec import (LABEL_SCALES, SCALE_NONE, AGGREGATIONS, AREA, BAR, BAR_LIKE,
+                         CHART_TYPES, CONNECTED_SCATTER, CategorySpec, ChartSpec,
+                         DONUT, DONUT_LABEL_MODES, DONUT_LABEL_PLACES,
+                         HBAR, LINE, LOLLIPOP, SCALES, SCATTER, SLICE_SORTS,
+                         SeriesSpec, TRANSFORMS, palette_color)
 from .preview import PreviewPanel
+from .tooltips import apply_tooltips
 from .widgets import (WideComboBox, AutoRange, ColorButton, combo, fill_columns, form,
                       group, hint, hline, scroller, spin)
 
 APP_NAME = "AE Graph Forge"
+
+# Chart types whose rows are aggregated into groups before anything is drawn.
+# All of them read Group by / Aggregate / Order, not just the plain bars.
+GROUPED_TYPES = tuple(BAR_LIKE) + (DONUT,)
+# ... and of those, the ones that colour each group individually. Grouped and
+# stacked bars take their colours from the series instead.
+PER_GROUP_COLOR = (BAR, HBAR, LOLLIPOP, DONUT)
+
+# What a dropped file is taken to be. The delimiter inside a .txt is sniffed
+# on load, so it is offered here on the same footing as .csv and .tsv.
+DATA_SUFFIXES = (".csv", ".tsv", ".txt")
+PRESET_SUFFIXES = (".json",)
+
+DROP_HINT_CSS = """
+    background: rgba(20, 21, 25, 190);
+    color: #e8eaf0;
+    font-size: 20px;
+    font-weight: 600;
+    border: 3px dashed #6f9ad8;
+    border-radius: 10px;
+"""
 
 
 class MainWindow(QMainWindow):
@@ -50,6 +73,8 @@ class MainWindow(QMainWindow):
         self._loading = False
         self._script_dirty = True
         self._cat_buttons: Dict[str, ColorButton] = {}
+        self._slice_buttons: Dict[str, ColorButton] = {}
+        self._slice_levels: List[str] = []
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -101,6 +126,20 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(1, 1)
         split.setSizes([450, 1050])
         self.setCentralWidget(split)
+
+        # Files can be dropped anywhere on the window. The three large panes
+        # on the right accept drops of their own by default, which would
+        # swallow the event before it reached us, so they are opted out.
+        self.setAcceptDrops(True)
+        for pane in (self.script, self.table, self.col_list):
+            pane.setAcceptDrops(False)
+        self._drop_hint = QLabel("", self)
+        self._drop_hint.setAlignment(Qt.AlignCenter)
+        self._drop_hint.setStyleSheet(DROP_HINT_CSS)
+        self._drop_hint.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._drop_hint.hide()
+
+        apply_tooltips(self)
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
@@ -180,16 +219,62 @@ class MainWindow(QMainWindow):
         f.addRow("Order by", srow)
         lay.addWidget(group("Chart", f))
 
-        # -- bar options --------------------------------------------------
+        # -- grouping (bars, lollipop and donut all aggregate first) -------
         bf = form()
         self.cb_group = WideComboBox()
         self.cb_agg = combo(AGGREGATIONS, "sum")
+        self.cb_slice_sort = combo(SLICE_SORTS, "value_desc")
         self.sp_maxbars = spin(0, 200, 20)
         bf.addRow("Group by", self.cb_group)
         bf.addRow("Aggregate", self.cb_agg)
-        bf.addRow("Max bars", self.sp_maxbars)
-        self.grp_bar = group("Bar options", bf)
+        bf.addRow("Order", self.cb_slice_sort)
+        self.lbl_maxbars = QLabel("Max groups")
+        bf.addRow(self.lbl_maxbars, self.sp_maxbars)
+        self.grp_bar = group("Grouping", bf)
         lay.addWidget(self.grp_bar)
+
+        # -- per-group colours --------------------------------------------
+        cf = form()
+        self.slice_holder = QWidget()
+        self.slice_layout = QGridLayout(self.slice_holder)
+        self.slice_layout.setContentsMargins(0, 0, 0, 0)
+        cf.addRow(self.slice_holder)
+        cf.addRow(hint("One swatch per group in the current chart. Changing "
+                       "'Group by' or the aggregation refreshes the list."))
+        self.grp_slice_colors = group("Group colours", cf)
+        lay.addWidget(self.grp_slice_colors)
+
+        # -- lollipop ------------------------------------------------------
+        lf = form()
+        self.sp_stem = spin(1, 60, 6, 1, 1)
+        self.sp_head = spin(4, 200, 26, 1, 1)
+        lf.addRow("Stem width", self.sp_stem)
+        lf.addRow("Head size", self.sp_head)
+        self.grp_lolli = group("Lollipop", lf)
+        lay.addWidget(self.grp_lolli)
+
+        # -- donut / pie ---------------------------------------------------
+        df = form()
+        self.sp_ring_r = spin(10, 100, 78, 1, 0, suffix=" %")
+        self.sp_ring_i = spin(0, 95, 55, 1, 0, suffix=" %")
+        self.sp_ring_gap = spin(0, 20, 0, 1, 1, suffix=" deg")
+        self.chk_dlabels = QCheckBox("Slice labels")
+        self.chk_dlabels.setChecked(True)
+        self.cb_dlabel = combo(DONUT_LABEL_MODES, "name_percent")
+        self.cb_dplace = combo(DONUT_LABEL_PLACES, "outside")
+        self.sp_dminpct = spin(0, 50, 0, 1, 1, suffix=" %")
+        df.addRow("Outer radius", self.sp_ring_r)
+        df.addRow("Inner radius", self.sp_ring_i)
+        df.addRow("Slice gap", self.sp_ring_gap)
+        df.addRow("", self.chk_dlabels)
+        df.addRow("Label text", self.cb_dlabel)
+        df.addRow("Label place", self.cb_dplace)
+        df.addRow("Hide under", self.sp_dminpct)
+        df.addRow(hint("Inner radius 0% gives a solid pie with no hole. "
+                       "The outer radius is a share of half the shorter side "
+                       "of the plot area."))
+        self.grp_donut = group("Donut / Pie", df)
+        lay.addWidget(self.grp_donut)
 
         # -- series -------------------------------------------------------
         sgroup = QGroupBox("Y series")
@@ -272,6 +357,7 @@ class MainWindow(QMainWindow):
         self.ed_rpre = QLineEdit()
         self.ed_rsuf = QLineEdit()
         self.sp_rdec = spin(0, 6, 0)
+        self.sp_rsize = spin(8, 200, 30, 1, 1)
         self.cb_rcorner = combo([("top_right", "Top right"), ("top_left", "Top left"),
                                  ("bottom_right", "Bottom right"),
                                  ("bottom_left", "Bottom left")], "top_right")
@@ -279,11 +365,10 @@ class MainWindow(QMainWindow):
         rf.addRow("Prefix", self.ed_rpre)
         rf.addRow("Suffix", self.ed_rsuf)
         rf.addRow("Decimals", self.sp_rdec)
+        rf.addRow("Text size", self.sp_rsize)
         rf.addRow("Corner", self.cb_rcorner)
         lay.addWidget(group("Readout", rf))
-        lay.addWidget(hint("The readout interpolates the chosen column as "
-                           "Progress sweeps, the way the launch-year counter "
-                           "works in your reference scripts."))
+
         lay.addStretch(1)
 
         self._wire_all(w)
@@ -311,14 +396,23 @@ class MainWindow(QMainWindow):
         chk_sep.setChecked(True)
         rng = AutoRange()
         sp_size = spin(6, 120, 22, 1, 1)
+        sp_tsize = spin(6, 160, 22, 1, 1)
+        sp_usize = spin(6, 120, 18, 1, 1)
+        cb_lscale = combo(LABEL_SCALES, SCALE_NONE)
+        chk_lsuffix = QCheckBox("Append K / M / B")
+        chk_lsuffix.setChecked(True)
 
         f.addRow("Title", ed_title)
+        f.addRow("Title size", sp_tsize)
         f.addRow("Unit", ed_unit)
+        f.addRow("Unit size", sp_usize)
         f.addRow("Scale", cb_scale)
         f.addRow("Range", rng)
         f.addRow("Tick count", sp_ticks)
         f.addRow("Decimals", sp_dec)
         f.addRow("Label size", sp_size)
+        f.addRow("Shorten labels", cb_lscale)
+        f.addRow("", chk_lsuffix)
         f.addRow("", chk_nice)
         f.addRow("", chk_sep)
         f.addRow("", chk_grid)
@@ -333,6 +427,10 @@ class MainWindow(QMainWindow):
         setattr(self, f"{prefix}_sep", chk_sep)
         setattr(self, f"{prefix}_range", rng)
         setattr(self, f"{prefix}_size", sp_size)
+        setattr(self, f"{prefix}_tsize", sp_tsize)
+        setattr(self, f"{prefix}_usize", sp_usize)
+        setattr(self, f"{prefix}_lscale", cb_lscale)
+        setattr(self, f"{prefix}_lsuffix", chk_lsuffix)
         g = group(title, f)
         if with_enable:
             g.setCheckable(True)
@@ -381,10 +479,7 @@ class MainWindow(QMainWindow):
         self.ed_psname.setPlaceholderText("optional exact PostScript name, e.g. Futura-Bold")
         tf.addRow("Font", self.fc_font)
         tf.addRow("PostScript name", self.ed_psname)
-        tf.addRow("", hint("After Effects matches fonts by PostScript name. The picker "
-                           "sends the family and the generated script tries the usual "
-                           "bold spellings, then falls back to Arial. If a font refuses "
-                           "to apply, put its exact PostScript name in the field above."))
+
         lay.addWidget(group("Text", tf))
 
         cf = form()
@@ -429,10 +524,7 @@ class MainWindow(QMainWindow):
         lf.addRow("", self.ck_fromzero)
         lf.addRow("Reveal lead", self.sp_lead)
         lf.addRow("Reveal lag", self.sp_lag)
-        lf.addRow("", hint("With this on, each point owns a slice of the timeline, so "
-                           "Progress 0 is an empty frame and even the first point "
-                           "animates in. Turn it off to match the original scripts, "
-                           "where the first point is already drawn at Progress 0."))
+
         lay.addWidget(group("Chrome", lf))
         lay.addStretch(1)
         self._wire_all(w)
@@ -563,7 +655,17 @@ class MainWindow(QMainWindow):
         s.sort_ascending = self.chk_sort_asc.isChecked()
         s.group_column = self.cb_group.currentData() or ""
         s.aggregation = self.cb_agg.currentData() or "sum"
+        s.slice_sort = self.cb_slice_sort.currentData() or "value_desc"
         s.max_bars = int(self.sp_maxbars.value())
+        s.lollipop_stem = float(self.sp_stem.value())
+        s.lollipop_dot = float(self.sp_head.value())
+        s.donut_radius_frac = float(self.sp_ring_r.value()) / 100.0
+        s.donut_inner_frac = float(self.sp_ring_i.value()) / 100.0
+        s.donut_gap_deg = float(self.sp_ring_gap.value())
+        s.donut_show_labels = self.chk_dlabels.isChecked()
+        s.donut_label_mode = self.cb_dlabel.currentData() or "name_percent"
+        s.donut_label_place = self.cb_dplace.currentData() or "outside"
+        s.donut_label_min_pct = float(self.sp_dminpct.value())
         s.arc_mode = self.cb_arc.currentData() or "chord"
 
         # axes
@@ -577,6 +679,10 @@ class MainWindow(QMainWindow):
             axis.decimals = int(getattr(self, f"{prefix}_dec").value())
             axis.thousands_sep = getattr(self, f"{prefix}_sep").isChecked()
             axis.label_size = float(getattr(self, f"{prefix}_size").value())
+            axis.title_size = float(getattr(self, f"{prefix}_tsize").value())
+            axis.unit_size = float(getattr(self, f"{prefix}_usize").value())
+            axis.label_scale = getattr(self, f"{prefix}_lscale").currentData() or SCALE_NONE
+            axis.label_scale_suffix = getattr(self, f"{prefix}_lsuffix").isChecked()
             r: AutoRange = getattr(self, f"{prefix}_range")
             axis.auto_min = r.auto_min.isChecked()
             axis.auto_max = r.auto_max.isChecked()
@@ -584,11 +690,15 @@ class MainWindow(QMainWindow):
             axis.vmax = float(r.vmax.value())
         s.y2_axis.enabled = self.ay2_box.isChecked()
 
-        # encodings
+        # Encodings. The colour map is the authority and the swatch editors
+        # write straight through to it (see _set_level_color), so it is copied
+        # as-is here. Rebuilding it from whichever editor happens to be on
+        # screen would let a stale one overwrite the other's colours.
+        colors = dict(s.category.colors)
         s.category = CategorySpec(
             column=self.cb_cat.currentData() or "",
             enabled=self.chk_cat.isChecked() and bool(self.cb_cat.currentData()),
-            colors={k: b.rgb() for k, b in self._cat_buttons.items()},
+            colors=colors,
             show_legend=True)
         s.size.column = self.cb_size.currentData() or ""
         s.size.enabled = self.chk_size.isChecked() and bool(s.size.column)
@@ -602,6 +712,7 @@ class MainWindow(QMainWindow):
         s.readout.prefix = self.ed_rpre.text()
         s.readout.suffix = self.ed_rsuf.text()
         s.readout.decimals = int(self.sp_rdec.value())
+        s.readout.size = float(self.sp_rsize.value())
         s.readout.corner = self.cb_rcorner.currentData() or "top_right"
 
         # style
@@ -667,7 +778,21 @@ class MainWindow(QMainWindow):
             self.chk_sort_asc.setChecked(s.sort_ascending)
             self._select(self.cb_group, s.group_column)
             self._select(self.cb_agg, s.aggregation)
+            self._select(self.cb_slice_sort, s.slice_sort)
             self.sp_maxbars.setValue(s.max_bars)
+            self.sp_stem.setValue(s.lollipop_stem)
+            self.sp_head.setValue(s.lollipop_dot)
+            # both are integer spin boxes, and a converted legacy preset can
+            # land slightly over the top of their range
+            self.sp_ring_r.setValue(int(round(min(100.0, max(10.0,
+                                    s.donut_radius_frac * 100.0)))))
+            self.sp_ring_i.setValue(int(round(min(95.0, max(0.0,
+                                    s.donut_inner_frac * 100.0)))))
+            self.sp_ring_gap.setValue(s.donut_gap_deg)
+            self.chk_dlabels.setChecked(s.donut_show_labels)
+            self._select(self.cb_dlabel, s.donut_label_mode)
+            self._select(self.cb_dplace, s.donut_label_place)
+            self.sp_dminpct.setValue(s.donut_label_min_pct)
             self._select(self.cb_arc, s.arc_mode)
 
             for prefix, axis in (("ax", s.x_axis), ("ay", s.y_axis), ("ay2", s.y2_axis)):
@@ -680,6 +805,10 @@ class MainWindow(QMainWindow):
                 getattr(self, f"{prefix}_dec").setValue(axis.decimals)
                 getattr(self, f"{prefix}_sep").setChecked(axis.thousands_sep)
                 getattr(self, f"{prefix}_size").setValue(axis.label_size)
+                getattr(self, f"{prefix}_tsize").setValue(axis.title_size)
+                getattr(self, f"{prefix}_usize").setValue(axis.unit_size)
+                self._select(getattr(self, f"{prefix}_lscale"), axis.label_scale)
+                getattr(self, f"{prefix}_lsuffix").setChecked(axis.label_scale_suffix)
                 getattr(self, f"{prefix}_range").set_values(
                     axis.auto_min, axis.vmin, axis.auto_max, axis.vmax)
             self.ay2_box.setChecked(s.y2_axis.enabled)
@@ -697,6 +826,7 @@ class MainWindow(QMainWindow):
             self.ed_rpre.setText(s.readout.prefix)
             self.ed_rsuf.setText(s.readout.suffix)
             self.sp_rdec.setValue(s.readout.decimals)
+            self.sp_rsize.setValue(s.readout.size)
             self._select(self.cb_rcorner, s.readout.corner)
 
             st = s.style
@@ -855,7 +985,8 @@ class MainWindow(QMainWindow):
         existing = self.spec.category.colors
         for i, lev in enumerate(col.categories[:24]):
             btn = ColorButton(existing.get(lev, palette_color(i + 1)))
-            btn.colorChanged.connect(self._schedule)
+            btn.colorChanged.connect(
+                lambda rgb, name=lev: self._set_level_color(name, rgb))
             self._cat_buttons[lev] = btn
             self.cat_layout.addWidget(QLabel(lev), i // 2, (i % 2) * 2)
             self.cat_layout.addWidget(btn, i // 2, (i % 2) * 2 + 1)
@@ -863,10 +994,89 @@ class MainWindow(QMainWindow):
             self._schedule()
 
     def _type_changed(self, *_) -> None:
+        """Show only the panels the current chart type actually reads.
+
+        Everything in GROUPED_TYPES aggregates rows into groups before drawing,
+        so they all want the Group by / Aggregate controls -- not just the two
+        plain bar charts.
+        """
         t = self.cb_type.currentData()
-        self.grp_bar.setVisible(t in (BAR, HBAR))
-        if not self._loading:
-            self._schedule()
+        grouped = t in GROUPED_TYPES
+        self.grp_bar.setVisible(grouped)
+        self.grp_slice_colors.setVisible(t in PER_GROUP_COLOR)
+        self.grp_lolli.setVisible(t == LOLLIPOP)
+        self.grp_donut.setVisible(t == DONUT)
+        self.lbl_maxbars.setText("Max slices" if t == DONUT else "Max groups")
+        # a donut has no axes to sort against; its order is the slice order
+        self.cb_sort.setEnabled(not grouped)
+        self.chk_sort_asc.setEnabled(not grouped)
+        if self._loading:
+            return
+        # Switching to a grouped chart with nothing to group by would put one
+        # slice on every row, so fall to the first category column instead.
+        if grouped and not self.cb_group.currentData() and self.ds is not None:
+            cats = self.ds.category_names()
+            if cats:
+                self.cb_group.blockSignals(True)
+                self._select(self.cb_group, cats[0])
+                self.cb_group.blockSignals(False)
+        self._schedule()
+
+    def _set_level_color(self, level: str, rgb) -> None:
+        """Record a colour picked for one category level or group.
+
+        Both swatch editors can be showing the same level at once, and either
+        can be holding values from a chart type that is no longer on screen.
+        So the pick goes straight into the spec, which is what the build reads,
+        and the twin swatch is nudged to match rather than left to disagree.
+        """
+        rgb = tuple(rgb)
+        self.spec.category.colors[level] = rgb
+        for holder in (self._cat_buttons, self._slice_buttons):
+            btn = holder.get(level)
+            if btn is not None and btn.rgb() != rgb:
+                btn.blockSignals(True)
+                btn.set_rgb(rgb)
+                btn.blockSignals(False)
+        self._schedule()
+
+    # -- per-group colour swatches ---------------------------------------
+    def _sync_slice_colors(self) -> None:
+        """Rebuild the group swatches from the model that was just built.
+
+        Taking the labels from the model rather than from the raw column means
+        the list matches what is on screen exactly, including the merged
+        'Other' slice, and it picks up the aggregation and top-N cut for free.
+        """
+        t = self.cb_type.currentData()
+        m = self.model
+        labels: List[str] = []
+        seed: Dict[str, tuple] = {}
+        if t in PER_GROUP_COLOR and m is not None and m.ok:
+            source = m.segments if t == DONUT else m.bars
+            for item in source:
+                if item.label not in seed:
+                    labels.append(item.label)
+                    seed[item.label] = tuple(item.color)
+        if labels == self._slice_levels:
+            return                                  # nothing moved, leave the widgets alone
+        self._slice_levels = labels
+
+        while self.slice_layout.count():
+            item = self.slice_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._slice_buttons.clear()
+        if not labels:
+            return
+        existing = self.spec.category.colors
+        for i, lev in enumerate(labels[:40]):
+            btn = ColorButton(existing.get(lev, seed[lev]))
+            btn.colorChanged.connect(
+                lambda rgb, name=lev: self._set_level_color(name, rgb))
+            self._slice_buttons[lev] = btn
+            self.slice_layout.addWidget(QLabel(lev), i // 2, (i % 2) * 2)
+            self.slice_layout.addWidget(btn, i // 2, (i % 2) * 2 + 1)
 
     def _fit_plot(self) -> None:
         w, h = int(self.sp_w.value()), int(self.sp_h.value())
@@ -877,24 +1087,132 @@ class MainWindow(QMainWindow):
         self._schedule()
 
     # =====================================================================
+    # drag and drop
+    # =====================================================================
+    @staticmethod
+    def _classify_drop(event) -> Tuple[Optional[str], Optional[str]]:
+        """Split a drop into (data file, preset file), either may be None.
+
+        Only local files count, and only the first of each kind: dropping a
+        folder or a bundle of ten CSVs should not silently pick one at random
+        beyond the obvious first-wins rule.
+        """
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return None, None
+        data = preset = None
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if not os.path.isfile(path):
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            if ext in DATA_SUFFIXES and data is None:
+                data = path
+            elif ext in PRESET_SUFFIXES and preset is None:
+                preset = path
+        return data, preset
+
+    def dragEnterEvent(self, event) -> None:
+        data, preset = self._classify_drop(event)
+        if data is None and preset is None:
+            event.ignore()
+            return
+        if data and preset:
+            text = "Drop to load the data and apply the preset"
+        elif data:
+            text = f"Drop to load {os.path.basename(data)}"
+        else:
+            text = f"Drop to apply {os.path.basename(preset)}"
+        self._show_drop_hint(text)
+        event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:
+        # Qt only keeps the drop target alive while move events are accepted.
+        if self._drop_hint.isVisible():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._drop_hint.hide()
+        event.accept()
+
+    def dropEvent(self, event) -> None:
+        self._drop_hint.hide()
+        data, preset = self._classify_drop(event)
+        if data is None and preset is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        # Data first: a preset dropped alongside it describes the new columns,
+        # so applying it afterwards is the order that leaves both in effect.
+        if data:
+            # An explicit drop of a preset says what the mapping should be, so
+            # do not spend effort auto-configuring one that is about to be
+            # replaced.
+            if not self.load_csv(data, keep_spec=True if preset else None):
+                return
+        if preset:
+            self.load_preset_file(preset)
+
+    def _show_drop_hint(self, text: str) -> None:
+        self._drop_hint.setText(text)
+        self._drop_hint.setGeometry(self.rect())
+        self._drop_hint.raise_()
+        self._drop_hint.show()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # __init__ resizes the window before _build_ui has made the overlay
+        hint_widget = getattr(self, "_drop_hint", None)
+        if hint_widget is not None and hint_widget.isVisible():
+            hint_widget.setGeometry(self.rect())
+
+    # =====================================================================
     # actions
     # =====================================================================
     def open_csv(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Open CSV", "", "Data files (*.csv *.tsv *.txt);;All files (*)")
-        if not path:
-            return
+        if path:
+            self.load_csv(path)
+
+    def load_csv(self, path: str, keep_spec: Optional[bool] = None) -> bool:
+        """Load a data file and rebuild the interface around it.
+
+        The Open button, the command line and a dropped file all come through
+        here, so the three routes cannot drift apart.
+
+        When the incoming file carries the same columns as the one it replaces
+        the current mapping still describes it, so the chart is kept rather
+        than thrown away -- which is what refreshing a dataset in place wants.
+        Anything else auto-configures from scratch. Pass keep_spec to force
+        either behaviour.
+        """
         try:
-            self.ds = Dataset.from_csv(path)
+            ds = Dataset.from_csv(path)
         except Exception as exc:
             QMessageBox.critical(self, "Could not read CSV", str(exc))
-            return
-        self.lbl_path.setText(f"{path}\n{self.ds.n_rows} rows, {len(self.ds.columns)} columns")
+            return False
+        if keep_spec is None:
+            keep_spec = self.ds is not None and self.ds.names == ds.names
+        self.ds = ds
+        self.lbl_path.setText(f"{path}\n{ds.n_rows} rows, {len(ds.columns)} columns")
         self.btn_auto.setEnabled(True)
         self._populate_columns()
         self._fill_table()
-        self.auto_configure()
+        if keep_spec:
+            self._apply()
+            self._refresh()
+            self.statusBar().showMessage(
+                f"Reloaded {os.path.basename(path)}: {ds.n_rows} rows, "
+                "same columns, chart kept.")
+        else:
+            self.auto_configure()
         self.tabs.setCurrentIndex(1)
+        return True
 
     def _populate_columns(self) -> None:
         ds = self.ds
@@ -989,6 +1307,7 @@ class MainWindow(QMainWindow):
             return
         self.preview.set_model(self.model)
         self._refresh_series_list()
+        self._sync_slice_colors()
         self._suggest_ranges()
         self._script_dirty = True
         if self._right.tabText(self._right.currentIndex()) == "Script":
@@ -1060,14 +1379,21 @@ class MainWindow(QMainWindow):
 
     def load_preset(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Load preset", "", "JSON (*.json)")
-        if not path:
-            return
+        if path:
+            self.load_preset_file(path)
+
+    def load_preset_file(self, path: str) -> bool:
+        """Apply a saved spec. Shared by the menu and by dropped .json files."""
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 self.spec = ChartSpec.from_json(fh.read())
         except Exception as exc:
             QMessageBox.critical(self, "Could not load preset", str(exc))
-            return
+            return False
         self._apply()
         self._refresh()
-        self.statusBar().showMessage(f"Loaded preset {os.path.basename(path)}")
+        msg = f"Loaded preset {os.path.basename(path)}"
+        if self.ds is None:
+            msg += ". Open a CSV to draw it."
+        self.statusBar().showMessage(msg)
+        return True

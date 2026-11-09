@@ -246,6 +246,17 @@ def format_value(v: float, decimals: int, thousands: bool) -> str:
 
 
 def format_ticks(ticks: Sequence[float], axis: AxisSpec) -> List[str]:
+    """Format tick values, applying the axis label scale.
+
+    The divisor only ever touches the printed text. Geometry, ranges and the
+    live readout all keep working in the raw units, so switching an axis to
+    "Millions" re-letters 4,500,000 as 4.5M and moves nothing.
+    """
+    div, sfx = axis.scale_factor(max((abs(t) for t in ticks), default=0.0))
+    if div != 1.0:
+        scaled = [t / div for t in ticks]
+        dec = axis.decimals if axis.decimals >= 0 else auto_decimals(scaled)
+        return [format_value(t, dec, axis.thousands_sep) + sfx for t in scaled]
     if axis.scale == SCALE_LOG:
         # decade ticks span orders of magnitude, so a single shared decimal
         # count would print most of them as "0"
@@ -255,7 +266,7 @@ def format_ticks(ticks: Sequence[float], axis: AxisSpec) -> List[str]:
             out.append(format_value(t, dec, axis.thousands_sep))
         return out
     dec = axis.decimals if axis.decimals >= 0 else auto_decimals(list(ticks))
-    return [format_value(t, dec, axis.thousands_sep) for t in ticks]
+    return [format_value(t, dec, axis.thousands_sep) + sfx for t in ticks]
 
 
 def year_tick_labels(ticks: Sequence[float]) -> List[str]:

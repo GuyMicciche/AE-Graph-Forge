@@ -8,6 +8,12 @@
   "max_bars": 20,
   "arc_mode": "chord",
   "bar_gap": 0.28,
+  "lollipop_stem": 6.0,
+  "lollipop_dot": 26.0,
+  "donut_radius_frac": 0.78,
+  "donut_thickness_frac": 0.22,
+  "donut_show_labels": true,
+  "donut_label_mode": "percent",
   "series": [
     {
       "column": "Latency_ms",
@@ -25,7 +31,7 @@
       "show_dots": false,
       "dot_size": 10.0,
       "fill_opacity": 0.0,
-      "smooth": true
+      "smooth": false
     },
     {
       "column": "Bandwidth_Mbps",
@@ -43,7 +49,7 @@
       "show_dots": false,
       "dot_size": 10.0,
       "fill_opacity": 0.0,
-      "smooth": true
+      "smooth": false
     }
   ],
   "x_axis": {
@@ -60,6 +66,10 @@
     "thousands_sep": true,
     "show_grid": true,
     "label_size": 22.0,
+    "title_size": 22.0,
+    "unit_size": 18.0,
+    "label_scale": "none",
+    "label_scale_suffix": true,
     "enabled": true
   },
   "y_axis": {
@@ -76,6 +86,10 @@
     "thousands_sep": true,
     "show_grid": true,
     "label_size": 22.0,
+    "title_size": 22.0,
+    "unit_size": 18.0,
+    "label_scale": "none",
+    "label_scale_suffix": true,
     "enabled": true
   },
   "y2_axis": {
@@ -92,6 +106,10 @@
     "thousands_sep": true,
     "show_grid": true,
     "label_size": 22.0,
+    "title_size": 22.0,
+    "unit_size": 18.0,
+    "label_scale": "none",
+    "label_scale_suffix": true,
     "enabled": false
   },
   "category": {
