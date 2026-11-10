@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import scales as sc
+from .animation import item_window
+from .spec import CANDLESTICK, HISTOGRAM, BOX_PLOT, HEATMAP
 from .dataset import CATEGORY, DATE, Dataset, NUMERIC
 from .geometry import PathGeometry, Pt, build_path
 from .layout import LegendLayout, pack_legend
@@ -79,6 +81,19 @@ class BarModel:
 
 
 @dataclass
+class CandleModel:
+    x: float
+    open_y: float
+    high_y: float
+    low_y: float
+    close_y: float
+    width: float
+    color: RGB
+    reveal_at: float
+    reveal_span: float
+
+
+@dataclass
 class LegendEntry:
     label: str
     color: RGB
@@ -124,6 +139,11 @@ class RenderModel:
     y2_ticks: List[TickModel] = field(default_factory=list)
     series: List[SeriesModel] = field(default_factory=list)
     bars: List[BarModel] = field(default_factory=list)
+    candles: List[CandleModel] = field(default_factory=list)
+    marks: list = field(default_factory=list)
+    boxes: list = field(default_factory=list)
+    cells: list = field(default_factory=list)
+    histogram_edges: list = field(default_factory=list)
     legend: List[LegendEntry] = field(default_factory=list)
     size_legend: List[Tuple[str, float]] = field(default_factory=list)
     legend_layout: LegendLayout = field(default_factory=LegendLayout)
@@ -183,7 +203,14 @@ def _ticks_for(axis, scale: sc.Scale, is_date: bool, step: float = 0.0) -> List[
     if not axis.show_grid and axis.tick_count <= 0:
         return []
     raw = sc.axis_ticks(axis, scale, step)
-    labels = (sc.year_tick_labels(raw) if is_date else sc.format_ticks(raw, axis))
+    if is_date and scale.vmax-scale.vmin < 2:
+        from .dataset import year_to_datetime
+        spacing = min((b-a for a,b in zip(raw,raw[1:])),default=1)
+        fmt = ("%d %b %H:%M" if spacing < 1/366 else
+               "%d %b %Y" if scale.vmax-scale.vmin < 0.25 else "%b %Y")
+        labels = [year_to_datetime(v).strftime(fmt) for v in raw]
+    else:
+        labels = sc.year_tick_labels(raw) if is_date else sc.format_ticks(raw, axis)
     return [TickModel(value=v, pixel=scale.px(v), label=lab)
             for v, lab in zip(raw, labels)]
 
@@ -241,13 +268,29 @@ def build_model(ds: Dataset, spec: ChartSpec) -> RenderModel:
             m.ok = False
             m.error = "No data loaded."
             return m
-        if spec.chart_type == DONUT:
+        c = spec.comp
+        if not (0 <= c.progress_start < c.progress_end <= c.duration):
+            raise ValueError("Progress times must satisfy 0 <= start < end <= comp duration.")
+        if c.plot_right <= c.plot_left or c.plot_bottom <= c.plot_top:
+            raise ValueError("Plot right/bottom must be greater than left/top.")
+        if c.fps <= 0 or c.width <= 0 or c.height <= 0:
+            raise ValueError("Composition dimensions and frame rate must be positive.")
+        if spec.chart_type in (HISTOGRAM,BOX_PLOT,HEATMAP):
+            from .distributions import build_distribution
+            m = build_distribution(ds,spec,m)
+        elif spec.chart_type == CANDLESTICK:
+            m = _build_candles(ds, spec, m)
+        elif spec.chart_type == DONUT:
             m = _build_donut(ds, spec, m)
         elif spec.is_bar:
             m = _build_bars(ds, spec, m)
         else:
             m = _build_points(ds, spec, m)
         if m.ok:
+            _configure_animation(m)
+            if m.marks:
+                from .distributions import configure_marks
+                configure_marks(m)
             _finalize_legend(m)
         return m
     except Exception as exc:                      # keep the UI alive
@@ -681,10 +724,12 @@ def _build_multi_bars(spec: ChartSpec, m: RenderModel, pairs, series_vals,
     k = len(cols)
     n = len(pairs)
 
+    pools = [[series_vals[c.column].get(lab,0.0) for c in cols] for lab,_ in pairs]
     if stacked:
-        top_total = max((sum(series_vals[c.column].get(lab, 0.0) for c in cols)
-                         for lab, _ in pairs), default=1.0)
-        lo, hi, bstep = sc.resolve_range(axis, 0.0, top_total, zero_base=True, pad=0.0)
+        pool = [sum(max(0,v) for v in row) for row in pools] + [sum(min(0,v) for v in row) for row in pools]
+    else:
+        pool = [v for row in pools for v in row]
+    lo,hi,bstep = sc.resolve_range(axis,min([0]+pool),max([0]+pool),zero_base=True,pad=0.0)
 
     m.y_scale = sc.make_scale(axis, B, T, lo, hi)
     m.x_scale = sc.Scale(vmin=0, vmax=max(1, n), p0=L, p1=R)
@@ -697,11 +742,17 @@ def _build_multi_bars(spec: ChartSpec, m: RenderModel, pairs, series_vals,
         at = _bar_reveal_at(i, n, spec)
         span = _reveal_span(n, spec)
         running = 0.0
+        positive = negative = 0.0
         for j, ss in enumerate(cols):
             v = series_vals[ss.column].get(lab, 0.0)
             if stacked:
+                running = positive if v >= 0 else negative
                 y0 = m.y_scale.px(running)
                 running += v
+                if v >= 0:
+                    positive = running
+                else:
+                    negative = running
                 y1 = m.y_scale.px(running)
                 bx, bw = cx, inner
                 seg_base = y0
@@ -886,3 +937,117 @@ def _place_segment_label(m: RenderModel, seg: SegmentModel, inside: bool) -> Non
     seg.label_x = m.donut_cx + math.cos(ang) * rad
     seg.label_y = m.donut_cy + math.sin(ang) * rad + 8.0
     seg.label_just = just
+
+
+def _configure_animation(m):
+    s, c = m.spec, m.spec.comp
+    if c.animation_mode == "uniform_x" or c.animation_mode == "uniform_path":
+        for seg in m.segments:
+            # Angular timing is proportional to the share, including slice gaps.
+            seg.reveal_at = (seg.start - m.donut_gap_frac/2)*100
+            seg.reveal_span = seg.fraction*100
+        total_distance = sum((b.width if s.chart_type == HBAR else b.height) for b in m.bars)
+        cursor = 0.0
+        marks = sorted(set(b.reveal_at for b in m.bars))
+        for b in m.bars:
+            if c.animation_mode == "uniform_path" and s.chart_type not in (GROUPED_BAR,STACKED_BAR):
+                span = (b.width if s.chart_type == HBAR else b.height)/max(1e-12,total_distance)*100
+                b.reveal_at,b.reveal_span = cursor+span,span
+                cursor += span
+            else:
+                rank = marks.index(b.reveal_at)
+                b.reveal_at,b.reveal_span = (rank+1)/max(1,len(marks))*100,100/max(1,len(marks))
+        for candle in m.candles:
+            candle.reveal_at = max(0,min(99,(candle.x-candle.width/2-c.plot_left)/(c.plot_right-c.plot_left)*100))
+            candle.reveal_span = max(0.001,min(100-candle.reveal_at,candle.width/(c.plot_right-c.plot_left)*100))
+        for sm in m.series:
+            if sm.path and c.animation_mode == "uniform_x" and _path_doubles_back(sm.path):
+                m.warnings.append("X doubles back; uniform draw-on uses path distance for this series.")
+            if sm.path:
+                from .motion import samples
+                times, arcs, pts = samples(sm.path)
+            for i, dot in enumerate(sm.dots):
+                if c.animation_mode == "uniform_x" and not (sm.path and _path_doubles_back(sm.path)):
+                    at = (dot.x-c.plot_left)/max(1,c.plot_right-c.plot_left)*100
+                elif sm.path:
+                    j = min(range(len(pts)),key=lambda j: (pts[j][0]-dot.x)**2+(pts[j][1]-dot.y)**2)
+                    at = arcs[j]*100
+                else:
+                    at = i/max(1,len(sm.dots)-1)*100
+                dot.reveal_at = max(0, min(99, at))
+                dot.reveal_span = min(1,100-dot.reveal_at)
+    if c.animation_mode == "rise":
+        n = max(m.n_points, 1)
+        duration = c.progress_end-c.progress_start
+        if c.stagger_seconds*max(0,n-1) > duration*0.95:
+            m.warnings.append("Stagger delay was shortened to fit all items inside the animation interval.")
+        for sm in m.series:
+            for i,dot in enumerate(sm.dots):
+                dot.reveal_at,dot.reveal_span = item_window(i,len(sm.dots),c)
+        # Sub-bars belonging to the same group keep a common window.
+        marks = sorted(set(b.reveal_at for b in m.bars))
+        for b in m.bars:
+            at,span = item_window(marks.index(b.reveal_at),len(marks),c)
+            b.reveal_at,b.reveal_span = at+span,span
+        for i,seg in enumerate(m.segments):
+            seg.reveal_at,seg.reveal_span = item_window(i,len(m.segments),c)
+        for i,candle in enumerate(m.candles):
+            candle.reveal_at,candle.reveal_span = item_window(i,len(m.candles),c)
+
+
+def _build_candles(ds, spec, m):
+    names = [spec.candle_open,spec.candle_high,spec.candle_low,spec.candle_close]
+    cols = [ds.col(name) for name in names]
+    xcol = ds.col(spec.x_column)
+    if xcol is None or not xcol.is_plottable:
+        raise ValueError("Pick a numeric or date column for X.")
+    if any(col is None or col.kind != NUMERIC for col in cols):
+        raise ValueError("Map numeric Open, High, Low and Close columns for candlesticks.")
+    scol = ds.col(spec.sort_column or spec.x_column)
+    order = sort_rows(scol.numeric,spec.sort_ascending) if scol and scol.is_plottable else list(range(ds.n_rows))
+    rows = []
+    invalid = 0
+    for i in order:
+        vals = [col.numeric[i] for col in cols]
+        x = xcol.numeric[i]
+        if x is None or any(v is None or not math.isfinite(v) for v in vals):
+            invalid += 1
+            continue
+        o,h,l,close = vals
+        if l > min(o,close) or h < max(o,close) or l > h:
+            invalid += 1
+            continue
+        rows.append((i,x,o,h,l,close))
+    if invalid:
+        m.warnings.append(f"Skipped {invalid} candle rows with missing or invalid OHLC values (Low <= Open/Close <= High required).")
+    if not rows:
+        raise ValueError("No valid OHLC rows to chart.")
+    c = spec.comp
+    lo,hi,step = sc.resolve_range(spec.x_axis,*_data_range([v[1] for v in rows]),zero_base=False,pad=0.03)
+    m.x_scale = sc.make_scale(spec.x_axis,c.plot_left,c.plot_right,lo,hi)
+    pool = [v for row in rows for v in (row[3],row[4])]
+    lo,hi,ystep = sc.resolve_range(spec.y_axis,*_data_range(pool),zero_base=False,pad=0.05)
+    if spec.y_axis.scale == "log" and min(pool) <= 0:
+        raise ValueError("Logarithmic candlesticks require positive OHLC values.")
+    m.y_scale = sc.make_scale(spec.y_axis,c.plot_bottom,c.plot_top,lo,hi)
+    xs = sorted(set(m.x_scale.px(row[1]) for row in rows))
+    spacing = min((b-a for a,b in zip(xs,xs[1:]) if b>a), default=(c.plot_right-c.plot_left)/max(1,len(rows)))
+    width = max(1,spacing*(1-spec.bar_gap))
+    n = len(rows)
+    for k,(i,x,o,h,l,close) in enumerate(rows):
+        m.candles.append(CandleModel(m.x_scale.px(x),m.y_scale.px(o),m.y_scale.px(h),
+            m.y_scale.px(l),m.y_scale.px(close),width,
+            spec.candle_up_color if close>=o else spec.candle_down_color,
+            _reveal_at(k,n,spec),_reveal_span(n,spec)))
+    m.n_points = n
+    m.row_order = [row[0] for row in rows]
+    m.x_ticks = _ticks_for(spec.x_axis,m.x_scale,xcol.kind==DATE,step)
+    m.y_ticks = _ticks_for(spec.y_axis,m.y_scale,False,ystep)
+    m.legend = [LegendEntry("Close >= Open",spec.candle_up_color),LegendEntry("Close < Open",spec.candle_down_color)]
+    return m
+
+
+def _path_doubles_back(path):
+    from .motion import samples
+    pts = samples(path)[2]
+    return any(b[0]<a[0] for a,b in zip(pts,pts[1:]))

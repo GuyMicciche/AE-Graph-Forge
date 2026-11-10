@@ -91,11 +91,15 @@ datasets with the same column names.
 
 ## Chart types
 
-Twelve types, in two families. The first five plot a value against a
+Sixteen types, including continuous, grouped, distribution and matrix charts. The first five plot a value against a
 continuous X; the rest aggregate rows into groups first.
 
 | Type | Notes |
 |---|---|
+| `histogram` | Equal-width bins with count, probability or density heights. |
+| `box_plot` | Grouped quartiles, median, 1.5 x IQR whiskers and optional outliers. |
+| `heatmap` | Aggregate a numeric value across row/column categories; missing cells stay blank. |
+| `candlestick` | Explicit Open, High, Low and Close mappings; up/down colours, wicks and doji bodies. Invalid OHLC rows are skipped with a warning. |
 | `line` | One or many series. Any series can be sent to a right-hand axis. |
 | `step_line` | Right-angled steps. The leading edge still crosses each data point at the same Progress a straight line would. |
 | `area` | Line plus a fill revealed by a Linear Wipe locked to the leading edge. |
@@ -546,3 +550,125 @@ exercised rather than just the model beneath it.
 
 The generated scripts have **not** been executed inside a real After Effects
 install, so give the first export a look before committing to a batch.
+
+
+## Animation controls (updated)
+
+Comp & Animation now separates **overall easing** (the Progress timeline) from
+**per-item easing** (each line segment, bar, dot movement or pie slice).
+Start and end strengths are independent. Choose Linear, Bezier/keyframe influence,
+Smoothstep, Sine, Quad, Cubic, Quart, Quint or Expo. For named curves, 0% blends
+back to Linear and 100% uses the full curve. Older presets continue to use their
+saved `ease_influence` for both ends and the original per-chart easing.
+
+Animation style:
+
+- **Original / by data point** keeps the original reveal order and Trim Paths
+  timing. The arc measure still controls the original chord/Bezier mapping.
+- **Draw on / uniform across screen** moves the line's leading edge across the
+  plot at a uniform X rate. Pie/donut charts use a continuous angular sweep,
+  giving larger slices proportionally more time. Bars grow linearly in order.
+- **Draw on / uniform path speed** draws a line at constant distance per unit of
+  Progress. Pie/donut charts again use angular distance. Single-series bars
+  allocate time by bar length; grouped/stacked bars stay synchronized per group.
+- **Rise / stagger items** moves line/scatter points from their baseline, grows
+  bars/candles and animates pie slices in overlapping windows. Delay 0 starts
+  them all together. Reverse changes the stagger order. Delay is measured in
+  seconds of the uneased Progress interval; overall easing also shapes these
+  delays. If the requested delay cannot fit, the model shortens it and warns.
+
+For constant speed in real time, choose **Linear overall easing**. Uniform modes
+bypass per-item easing on drawn paths, bars and slices so they do not pause at
+individual data items. A path that doubles back in X (including smoothing
+overshoot) cannot follow a one-direction horizontal sweep; that series falls
+back to constant path distance and the app shows a warning. Curve distance is
+sampled numerically, so small subpixel differences from AE are possible.
+
+Candlesticks are configured on Mapping: choose Candlestick, select X, then map
+Open/High/Low/Close. Each valid row becomes one candle. Equal Open and Close
+values produce a visible doji body. Low must be <= Open/Close <= High. The Y
+range includes wick extremes. Log Y requires positive OHLC values.
+
+CLI flags are available too, for example:
+
+```bash
+python forge_cli.py build prices.csv --type candlestick --x Date \
+  --open Open --high High --low Low --close Close \
+  --animation-mode rise --stagger-seconds 0.06 --ease-family sine \
+  --ease-start 100 --ease-end 70 -o prices.jsx
+```
+
+### Review fixes and verification
+
+- Preview playback now respects easing strength and curve selection.
+- Preview trimming uses arc length instead of Qt's Bezier parameter; tip dots
+  follow the actual curve and stay with the line's leading edge.
+- Missing-value dot timing is exported from the resolved model instead of
+  recomputing a compressed index in the script.
+- Stacked area fills are exported; area wipes account for composition width.
+- Negative bars grow in the correct direction, stacked segments use their own
+  baselines, and grouped/stacked ranges include individual positive/negative
+  values. Value labels and lollipop heads follow the growing bar ends.
+- Invalid Progress times and inverted plot bounds produce readable errors.
+- A zero easing value exports safely instead of constructing an invalid
+  zero-influence KeyframeEase.
+
+Run `python tools/check_animation.py` for curve parity, geometry, validation,
+preset compatibility and 104 JSX export combinations evaluated in the mock AE
+host. `python tools/check_donut.py` covers the existing chart/preset regressions.
+These checks do not replace opening a generated JSX in After Effects.
+
+
+## Histograms, box plots and heatmaps
+
+All three appear in Mapping > Chart type and use a dedicated **Value column**.
+Their options, colours, mappings and animation settings are saved in chart
+presets. They export editable AE shape layers and expressions just like the
+existing graphs.
+
+**Histogram**: choose a numeric Value column and a bin count. Zero chooses the
+square-root rule (capped at 100); explicit counts support 1 to 200 bins. Bins
+have equal data width, and the last bin includes the maximum observation.
+Count gives raw frequencies, Probability sums the bin heights to 1, and Density
+makes the total bar area equal 1. Constant values receive a nonzero bin range.
+Histogram axes must be linear. Set axis titles in Axes to match the chosen
+value and normalization. Missing values are skipped with a warning.
+
+**Box plot**: choose a numeric Value column and optional Group by column. Without
+a group column there is one box. The box spans Q1 to Q3 and its line is the
+median. Quartiles use linear interpolation at `(n - 1) * p`; whiskers reach the
+most extreme observations within 1.5 times the interquartile range. Values beyond
+that range are optional outlier dots. Max dot layers limits the outlier dots,
+while statistics always include every observation. Group ordering uses the
+median for value sorts; 0 Max groups includes all groups. Single-observation
+and constant groups remain visible. Log Y requires positive plotted values.
+
+**Heatmap**: map Columns and Rows to category columns (numeric/date columns may
+also serve as category labels). Map the Value column and select Sum, Mean,
+Median, Count, Min or Max. Count works without a numeric Value mapping. Repeated
+pairs are aggregated; missing combinations remain blank, and genuine zero
+values get a colour. Categories retain their first-seen CSV order. The colour
+legend covers the observed aggregate minimum/maximum; equal-valued cells use
+the gradient midpoint. Cell values can be hidden, and text is fitted to each
+cell and omitted when it would be smaller than 8 px. Grids larger than 1600
+cells are rejected with a readable message. Axis numeric ranges/scales do not
+change category placement; use axis titles and label sizes for presentation.
+
+Animation: histograms use the existing bar growth controls. Box-plot parts stay
+synchronized by group; Rise animates them from the plot bottom. Heatmaps reveal
+cells in row order, sweep columns together in uniform horizontal mode, or rise
+with the configured delay. Delay 0 starts every group/cell together. Uniform
+modes use linear item timing; overall easing still shapes the whole timeline.
+
+CLI examples:
+
+```bash
+python forge_cli.py build data.csv --type histogram --value-column Amount --histogram-bins 12 -o histogram.jsx
+python forge_cli.py build data.csv --type box_plot --value-column Amount --group-by Region -o boxes.jsx
+python forge_cli.py build data.csv --type heatmap --value-column Amount --heatmap-x Month --heatmap-y Region --agg mean -o heatmap.jsx
+```
+
+Run `python tools/check_distributions.py` for statistics, edge cases, preset
+round trips and UI mapping checks. The expanded `tools/check_animation.py` now
+checks 128 graph/mode/control-binding export combinations through the mock AE
+host, including all three new chart types.

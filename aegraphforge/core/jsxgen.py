@@ -22,6 +22,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .build import BarModel, DotModel, RenderModel, SeriesModel
 from .geometry import fmt_list, fmt_num, fmt_pairs, r2, r6
+from .animation import ease_js, item_ease_js
+from .motion import state_js, rise_js
+from .spec import CANDLESTICK, HISTOGRAM, BOX_PLOT, HEATMAP
 from .spec import (AREA, BAR, CONNECTED_SCATTER, ChartSpec, DONUT, GROUPED_BAR,
                    HBAR, LINE, LOLLIPOP, STACKED_AREA, STACKED_BAR, STEP_LINE, RGB,
                    SCATTER)
@@ -43,6 +46,7 @@ def _sq(text: str, newline: bool = False) -> str:
     """Single-quoted JS literal, used when building an expression by
     concatenation inside a generated loop."""
     esc = str(text).replace("\\", "\\\\").replace("'", "\\'")
+    esc = esc.replace("\n", "\\n").replace("\r", "").replace("\t", "\\t")
     return "'" + esc + ("\\n" if newline else "") + "'"
 
 
@@ -137,6 +141,10 @@ class JSXGenerator:
         self._legend()
         if s.chart_type == DONUT:
             self._donut()
+        elif m.marks:
+            self._marks()
+        elif s.chart_type == CANDLESTICK:
+            self._candles()
         elif s.is_bar:
             self._bars()
         else:
@@ -564,8 +572,9 @@ function buildRing(name, radius, thickness, color) {{
 }}
 
 function easyEase(prop, idx) {{
-    var ease = new KeyframeEase(0, {fmt_num(s.comp.ease_influence)});
-    prop.setTemporalEaseAtKey(idx, [ease], [ease]);
+    var incoming = new KeyframeEase(0, {fmt_num(max(0.1, min(100,s.comp.ease_influence if s.comp.ease_end is None else s.comp.ease_end)))});
+    var outgoing = new KeyframeEase(0, {fmt_num(max(0.1, min(100,s.comp.ease_influence if s.comp.ease_start is None else s.comp.ease_start)))});
+    prop.setTemporalEaseAtKey(idx, [incoming], [outgoing]);
 }}
 
 function buildPlayhead() {{
@@ -632,8 +641,17 @@ function buildPlayhead() {{
                f'.property({jstr(self._ctrl_names["progress"])}).property("Slider");')
         self.w("progressSlider.setValueAtTime(PROGRESS_START_T, 0);")
         self.w("progressSlider.setValueAtTime(PROGRESS_END_T, 100);")
-        self.w("easyEase(progressSlider, 1);")
-        self.w("easyEase(progressSlider, 2);")
+        c = s.comp
+        a = c.ease_influence if c.ease_start is None else c.ease_start
+        b = c.ease_influence if c.ease_end is None else c.ease_end
+        if c.ease_family == "bezier" and a > 0 and b > 0:
+            self.w("easyEase(progressSlider, 1);")
+            self.w("easyEase(progressSlider, 2);")
+        else:
+            self.w("progressSlider.setInterpolationTypeAtKey(1, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR);")
+            self.w("progressSlider.setInterpolationTypeAtKey(2, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR);")
+            self.w("progressSlider.expression = " + expr([
+                ease_js(c.ease_family,a,b), "animEase(value / 100) * 100;"]) + ";")
 
         if s.style.bind_to_controls:
             self.w("")
@@ -650,14 +668,14 @@ function buildPlayhead() {{
         bind = s.style.bind_to_controls
         self.section("GRIDLINES + AXIS LABELS")
 
-        show_h = s.y_axis.show_grid and (m.y_ticks or m.y2_ticks)
+        show_h = s.chart_type != HEATMAP and s.y_axis.show_grid and (m.y_ticks or m.y2_ticks)
         if m.y_ticks:
             self.w("var yTickPix = " + fmt_list([t.pixel for t in m.y_ticks], r2) + ";")
             self.w("var yTickLab = [" + ", ".join(jstr(t.label) for t in m.y_ticks) + "];")
             if m.y2_ticks:
                 self.w("var y2TickLab = [" + ", ".join(jstr(t.label) for t in m.y2_ticks) + "];")
             self.w("for (var g = 0; g < yTickPix.length; g++) {", 1)
-            if show_h and (not s.is_bar or s.chart_type == BAR):
+            if show_h and (not s.is_bar or s.chart_type in (BAR,HISTOGRAM)):
                 self.w("var gl = addHGridline(yTickPix[g], PLOT_R - PLOT_L);", 2)
                 if bind:
                     self.w('gl.property("Transform").property("Opacity").expression = GRID_OP_EXPR;', 2)
@@ -785,7 +803,7 @@ function buildPlayhead() {{
                 color_expr = expr([CTRL, f'ctrl.effect({jstr(self._ctrl_names[ckey])})("Color");'])
 
             # area fill
-            if sm.path is not None and (s.chart_type == AREA or sm.spec.fill_opacity > 0):
+            if sm.path is not None and (s.chart_type in (AREA,STACKED_AREA) or sm.spec.fill_opacity > 0):
                 self._emit_area(tag, sm, i, color_expr)
 
             # the line
@@ -793,16 +811,14 @@ function buildPlayhead() {{
                 self.w(f"var line{i} = buildLineLayer({jstr(sm.safe_name + '_LINE')}, "
                        f"{tag}_VERTICES, {tag}_IN, {tag}_OUT, {jcolor(sm.color)}, "
                        f"{fmt_num(sm.spec.stroke_width)}, false);")
-                self.w(f'vprop(line{i}, "LineGroup", "Trim").property("End").expression = '
-                       + expr([
-                    CTRL, PROG,
-                    f"var N = {sm.path.n};",
-                    f"var arc = {fmt_list(sm.path.arc, lambda v: round(v, 5))};",
-                    "var idx = (progress/100)*(N-1);",
-                    "var i = Math.floor(Math.min(Math.max(idx,0), N-2));",
-                    "var frac = idx - i;",
-                    "(arc[i] + (arc[i+1]-arc[i])*frac) * 100;",
-                ]) + ";")
+                if s.comp.animation_mode == "rise":
+                    self.w(f'vprop(line{i}, "LineGroup", "Trim").property("End").setValue(100);')
+                    self.w(f'vprop(line{i}, "LineGroup", "LinePath").property("Path").expression = ' + expr(
+                        [CTRL,PROG] + rise_js(sm.path.points,sm.path.in_tangents,sm.path.out_tangents,
+                                              s,sm.baseline_pixel)) + ";")
+                else:
+                    self.w(f'vprop(line{i}, "LineGroup", "Trim").property("End").expression = ' + expr(
+                        [CTRL,PROG]+state_js(sm.path,s)+["motion[0];"]) + ";")
                 if bind:
                     self.w(f'vprop(line{i}, "LineGroup", "LineStroke")'
                            f'.property("Stroke Width").expression = ' + expr([
@@ -837,22 +853,17 @@ function buildPlayhead() {{
         self.w(f"var area{i} = buildAreaLayer({jstr(sm.safe_name + '_AREA')}, "
                f"{fmt_pairs(verts, r2)}, {fmt_pairs(ins, r6)}, {fmt_pairs(outs, r6)}, "
                f"{jcolor(sm.color)}, {fmt_num(op)});")
-        self.w("// Reveal the fill with a Linear Wipe locked to the line's leading edge.")
-        self.w(f'var wipe{i} = area{i}.property("Effects").addProperty("ADBE Linear Wipe");')
-        self.w(f'wipe{i}.property("Wipe Angle").setValue(-90);')
-        self.w(f'wipe{i}.property("Feather").setValue(0);')
-        self.w(f'wipe{i}.property("Transition Completion").expression = ' + expr([
-            CTRL, PROG,
-            f"var N = {p.n};",
-            f"var px = {fmt_list(p.xs, r2)};",
-            "var idx = (progress/100)*(N-1);",
-            "var i = Math.floor(Math.min(Math.max(idx,0), N-2));",
-            "var frac = idx - i;",
-            "var x = px[i] + (px[i+1]-px[i])*frac;",
-            f"var t = (x - {fmt_num(s.comp.plot_left)}) / "
-            f"({fmt_num(s.comp.plot_right)} - {fmt_num(s.comp.plot_left)});",
-            "100 - Math.min(Math.max(t, 0), 1) * 100;",
-        ]) + ";")
+        if s.comp.animation_mode == "rise":
+            ranks = list(range(p.n)) + (list(reversed(range(p.n))) if sm.lower_points else [p.n-1,0])
+            self.w(f'vprop(area{i}, "AreaGroup", "AreaPath").property("Path").expression = ' + expr(
+                [CTRL,PROG]+rise_js(verts,ins,outs,s,base,ranks,p.n,True)) + ";")
+        else:
+            # Linear Wipe uses full composition width, not the plot rectangle.
+            self.w(f'var wipe{i} = area{i}.property("Effects").addProperty("ADBE Linear Wipe");')
+            self.w(f'wipe{i}.property("Wipe Angle").setValue(-90);')
+            self.w(f'wipe{i}.property("Feather").setValue(0);')
+            self.w(f'wipe{i}.property("Transition Completion").expression = ' + expr(
+                [CTRL,PROG]+state_js(p,s)+[f"100 - Math.max(0,Math.min(1,motion[1]/{s.comp.width}))*100;"]) + ";")
         if color_expr:
             self.w(f'vprop(area{i}, "AreaGroup", "AreaFill")'
                    f'.property("Color").expression = {color_expr};')
@@ -873,6 +884,10 @@ function buildPlayhead() {{
         That is how per-layer values such as `revealAt` get baked into an
         expression built inside a JS loop, exactly as the reference scripts do.
         """
+        lines = list(lines)
+        if any(isinstance(ln,str) and "animEase(" in ln for ln in lines) and not any(
+                isinstance(ln,str) and "function animEase" in ln for ln in lines):
+            lines.insert(0,item_ease_js(self.s.comp))
         self.w(f"{target}.expression =", indent)
         rows: List[str] = []
         for i, ln in enumerate(lines):
@@ -929,14 +944,15 @@ function buildPlayhead() {{
                f"{diam_ref}, {col_ref});", 2)
         self.w('dot.property("Transform").property("Position")'
                f".setValue([{tag}_DOT_X[k], {tag}_DOT_Y[k]]);", 2)
-        span = dots[0].reveal_span if dots else 0.0
-        if s.style.reveal_from_zero:
-            self.w(f"// Each point owns a slot of the timeline, so at Progress 0")
-            self.w(f"// nothing is drawn and even the first point animates in.", 2)
-            self.w(f"var revealAt = (k / {tag}_DOT_X.length) * 100;", 2)
-        else:
-            self.w(f"var revealAt = (k / ({tag}_DOT_X.length - 1)) * 100;", 2)
-        self.w(f"var revealSpan = {fmt_num(round(span, 6))};", 2)
+        self.w("var revealAt = " + fmt_list([d.reveal_at for d in dots],lambda x:round(x,6)) + "[k];",2)
+        self.w("var revealSpan = " + fmt_list([d.reveal_span for d in dots],lambda x:round(x,6)) + "[k];",2)
+        if s.comp.animation_mode == "rise":
+            self._emit_expr_assign('dot.property("Transform").property("Position")',[
+                CTRL,PROG,item_ease_js(s.comp),
+                ["var at=", "~revealAt", ", span=", "~revealSpan", ";"],
+                ["var x=", "~"+tag+"_DOT_X[k]", ", y=", "~"+tag+"_DOT_Y[k]", ";"],
+                f"var w=animEase((progress-at)/Math.max(0.001,span)); [x,{sm.baseline_pixel}+(y-{sm.baseline_pixel})*w];"
+            ],indent=2)
 
         # colour binding
         if bind and slot_ctrl:
@@ -964,7 +980,8 @@ function buildPlayhead() {{
                 ["var span = ", "~revealSpan", ";"],
                 "var lo = Math.max(0, at - soft);",
                 "var hi = Math.max(lo + 0.001, at + span + soft * 0.33);",
-                "linear(progress, lo, hi, 0, op);",
+                item_ease_js(s.comp,"linear"),
+                "op*animEase((progress-lo)/(hi-lo));",
             ], indent=2)
             self.w('dot.property("Transform").property("Scale").expression = ' + expr([
                 CTRL,
@@ -979,7 +996,8 @@ function buildPlayhead() {{
                 ["var span = ", "~revealSpan", ";"],
                 f"var lo = Math.max(0, at - {fmt_num(s.style.dot_reveal_lead)});",
                 f"var hi = Math.max(lo + 0.001, at + span + {fmt_num(s.style.dot_reveal_lag)});",
-                f"linear(progress, lo, hi, 0, {fmt_num(s.style.dot_opacity)});",
+                item_ease_js(s.comp,"linear"),
+                f"{fmt_num(s.style.dot_opacity)}*animEase((progress-lo)/(hi-lo));",
             ], indent=2)
         self.w("}", 1)
 
@@ -987,6 +1005,8 @@ function buildPlayhead() {{
     def _playhead_and_tip(self) -> None:
         m, s = self.m, self.s
         bind = s.style.bind_to_controls
+        if s.comp.animation_mode == "rise":
+            return
         paths = [sm for sm in m.series if sm.path is not None]
         if not paths or s.chart_type == SCATTER:
             if not (s.style.show_tip_dot and paths):
@@ -1006,17 +1026,8 @@ function buildPlayhead() {{
         if s.style.show_playhead:
             self.w("")
             self.w("var playhead = buildPlayhead();")
-            self.w('playhead.property("Transform").property("Position").expression = ' + expr([
-                CTRL, PROG,
-                f"var N = {p.n};",
-                f"var px = {fmt_list(p.xs, r2)};",
-                "var idx = (progress/100)*(N-1);",
-                "var i = Math.floor(Math.min(Math.max(idx,0), N-2));",
-                "var frac = idx - i;",
-                "var x = px[i] + (px[i+1]-px[i])*frac;",
-                "[x, (PLOT_T + PLOT_B) / 2];".replace("PLOT_T", fmt_num(s.comp.plot_top))
-                                             .replace("PLOT_B", fmt_num(s.comp.plot_bottom)),
-            ]) + ";")
+            self.w('playhead.property("Transform").property("Position").expression = ' + expr(
+                [CTRL,PROG]+state_js(p,s)+[f"[motion[1], {(s.comp.plot_top+s.comp.plot_bottom)/2}];"]) + ";")
             if "playhead_width" in self._ctrl_names:
                 self.w('playhead.property("Transform").property("Scale").expression = ' + expr([
                     CTRL,
@@ -1037,16 +1048,8 @@ function buildPlayhead() {{
             self.w("")
             self.w(f"var tip = buildDot(\"TIP_DOT\", {fmt_num(s.style.tip_dot_size)}, "
                    f"{jcolor(lead.color)});")
-            self.w('tip.property("Transform").property("Position").expression = ' + expr([
-                CTRL, PROG,
-                f"var N = {p.n};",
-                f"var px = {fmt_list(p.xs, r2)};",
-                f"var py = {fmt_list(p.ys, r2)};",
-                "var idx = (progress/100)*(N-1);",
-                "var i = Math.floor(Math.min(Math.max(idx,0), N-2));",
-                "var frac = idx - i;",
-                "[px[i] + (px[i+1]-px[i])*frac, py[i] + (py[i+1]-py[i])*frac];",
-            ]) + ";")
+            self.w('tip.property("Transform").property("Position").expression = ' + expr(
+                [CTRL,PROG]+state_js(p,s)+["[motion[1],motion[2]];"]) + ";")
             self.w('tip.property("Transform").property("Opacity").expression = fadeExpr;')
             if bind:
                 self.w('tip.property("Transform").property("Scale").expression = ' + expr([
@@ -1056,6 +1059,64 @@ function buildPlayhead() {{
                     "var k = base > 0 ? (d / base) * 100 : 100;",
                     "[k, k];",
                 ]) + ";")
+
+    def _marks(self):
+        from .distributions import mark_timing_js
+        s = self.s
+        self.section("DISTRIBUTION / MATRIX MARKS")
+        for i,mark in enumerate(self.m.marks):
+            tag = f"MARK_{i}"
+            timing = [CTRL,PROG]+mark_timing_js(mark,s)
+            if s.chart_type == BOX_PLOT:
+                base = s.comp.plot_bottom if s.comp.animation_mode=="rise" else mark.base
+                position = f"[{mark.x},{base}+({mark.y}-{base})*g];"
+                size = f"[{mark.width},Math.max(1,{mark.height}*g)];"
+            else:
+                position = (f"[{mark.x},{s.comp.plot_bottom}+({mark.y}-{s.comp.plot_bottom})*g];"
+                            if s.comp.animation_mode=="rise" else f"[{mark.x},{mark.y}];")
+                size = f"[{mark.width},{mark.height}];"
+            if mark.kind=="dot":
+                self.w(f"var {tag}=buildDot({jstr(tag)},{mark.width},{jcolor(mark.color)});")
+                target = f'vprop({tag},"Dot","DotShape")'
+            else:
+                self.w(f"var {tag}=buildBar({jstr(tag)},{mark.width},{mark.height},{jcolor(mark.color)});")
+                target = f'vprop({tag},"Bar","BarRect")'
+                if mark.kind=="outline":
+                    self.w(f'vprop({tag},"Bar","BarFill").property("Opacity").setValue(0);')
+                    self.w(f'var stroke=vgroup({tag},"Bar").property("Contents").addProperty("ADBE Vector Graphic - Stroke");')
+                    self.w('stroke.name="BoxStroke";')
+                    self.w(f'vprop({tag},"Bar","BoxStroke").property("Color").setValue({jcolor(mark.color)});')
+                    self.w(f'vprop({tag},"Bar","BoxStroke").property("Stroke Width").setValue(2);')
+            self.w(target+'.property("Size").expression = '+expr(timing+[size])+";")
+            self.w(f'{tag}.property("Transform").property("Position").expression = '+expr(timing+[position])+";")
+            self.w(f'{tag}.property("Transform").property("Opacity").expression = '+expr(timing+["g*100;"])+";")
+            if mark.text:
+                fs = min(s.style.legend_size,(mark.width-6)/max(1,len(mark.text)*0.65),mark.height-4)
+                if fs>=8:
+                    lum = sum(a*b for a,b in zip(mark.color,(0.2126,0.7152,0.0722)))
+                    color = (0.05,0.05,0.05) if lum>0.55 else (1,1,1)
+                    self.w(f'var cellLabel{i}=makeText({jstr(mark.text)},{fs},{jcolor(color)},[0,0],"center");')
+                    self.w(f'cellLabel{i}.property("Transform").property("Position").expression = '+expr(
+                        timing+["var pos="+position, f"[pos[0],pos[1]+{fs*0.35}];"])+";")
+                    self.w(f'cellLabel{i}.property("Transform").property("Opacity").expression = '+expr(timing+["g*100;"])+";")
+
+    def _candles(self):
+        s = self.s
+        self.section("CANDLESTICKS / OHLC")
+        for i,c in enumerate(self.m.candles):
+            base = s.comp.plot_bottom if s.comp.animation_mode == "rise" else c.open_y
+            timing = [CTRL,PROG,item_ease_js(s.comp),
+                      f"var g=animEase((progress-{c.reveal_at})/Math.max(0.001,{c.reveal_span}));"]
+            for part,top,bottom,width in (("WICK",c.high_y,c.low_y,2),
+                                          ("BODY",min(c.open_y,c.close_y),max(c.open_y,c.close_y),c.width)):
+                name = f"CANDLE_{i}_{part}"
+                self.w(f"var {name}=buildBar({jstr(name)},{fmt_num(width)},1,{jcolor(c.color)});")
+                self.w(f'vprop({name},"Bar","BarRect").property("Size").expression = '+expr(timing+[
+                    f"[{width},Math.max(1,{bottom-top}*g)];"]) + ";")
+                self.w(f'{name}.property("Transform").property("Position").expression = '+expr(timing+[
+                    f"[{c.x},{base}+({(top+bottom)/2}-{base})*g];"]) + ";")
+                self.w(f'{name}.property("Transform").property("Opacity").expression = '+expr(timing+[
+                    "g>0 ? 100 : 0;"]) + ";")
 
     # -- bars ------------------------------------------------------------
     def _bars(self) -> None:
@@ -1067,6 +1128,7 @@ function buildPlayhead() {{
         self.w("var BAR_Y = " + fmt_list([b.y for b in m.bars], r2) + ";")
         self.w("var BAR_W = " + fmt_list([b.width for b in m.bars], r2) + ";")
         self.w("var BAR_H = " + fmt_list([b.height for b in m.bars], r2) + ";")
+        self.w("var BAR_SPAN = " + fmt_list([b.reveal_span for b in m.bars],lambda x:round(x,6)) + ";")
         self.w("var BAR_AT = " + fmt_list([b.reveal_at for b in m.bars], r2) + ";")
         self.w("var BAR_LABEL = [" + ", ".join(jstr(b.value_label or b.label)
                                                for b in m.bars) + "];")
@@ -1077,8 +1139,9 @@ function buildPlayhead() {{
                 uniq.append(c)
         self.w("var BAR_COLORS = [" + ", ".join(jcolor(c) for c in uniq) + "];")
         self.w("var BAR_CIDX = " + fmt_list([uniq.index(c) for c in colors], lambda v: int(v)) + ";")
-        base = m.bars[0].base if m.bars else 0.0
-        self.w(f"var BAR_BASE = {fmt_num(r2(base))};")
+        self.w("var BAR_BASE = " + fmt_list([b.base for b in m.bars],r2) + ";")
+        signs = [(1 if b.x >= b.base else -1) if horiz else (1 if b.y < b.base else -1) for b in m.bars]
+        self.w("var BAR_SIGN = " + fmt_list(signs) + ";")
         self.w("")
         self.w("for (var b = 0; b < BAR_X.length; b++) {", 1)
         self.w('var bar = buildBar("BAR_" + b, BAR_W[b], BAR_H[b], BAR_COLORS[BAR_CIDX[b]]);', 2)
@@ -1086,14 +1149,14 @@ function buildPlayhead() {{
             self.w('vprop(bar, "Bar", "BarRect").property("Position")'
                    '.setValue([BAR_W[b] / 2, 0]);', 2)
             self.w('bar.property("Transform").property("Anchor Point").setValue([0, 0]);', 2)
-            self.w('bar.property("Transform").property("Position").setValue([BAR_BASE, BAR_Y[b] + BAR_H[b] / 2]);', 2)
-            grow = "[g, 100];"
+            self.w('bar.property("Transform").property("Position").setValue([BAR_BASE[b], BAR_Y[b]]);', 2)
+            grow = "[g*sign, 100];"
         else:
             self.w('vprop(bar, "Bar", "BarRect").property("Position")'
                    '.setValue([0, -BAR_H[b] / 2]);', 2)
             self.w('bar.property("Transform").property("Anchor Point").setValue([0, 0]);', 2)
-            self.w('bar.property("Transform").property("Position").setValue([BAR_X[b], BAR_BASE]);', 2)
-            grow = "[100, g];"
+            self.w('bar.property("Transform").property("Position").setValue([BAR_X[b], BAR_BASE[b]]);', 2)
+            grow = "[100, g*sign];"
         soft_line = (f'var soft = ctrl.effect("{self._ctrl_names["softness"]}")("Slider");'
                      if bind else f"var soft = {fmt_num(s.style.dot_reveal_lead)};")
         bspan = m.bars[0].reveal_span if m.bars else 0.0
@@ -1101,10 +1164,13 @@ function buildPlayhead() {{
             'var ctrl = thisComp.layer("MASTER_CONTROLS");',
             f'var progress = ctrl.effect("{self._ctrl_names["progress"]}")("Slider");',
             soft_line,
+            ["var sign = ", "~BAR_SIGN[b]", ";"],
             ["var at = ", "~BAR_AT[b]", ";"],
-            f"var span = {fmt_num(round(bspan, 6))};",
+            ["var span = ", "~BAR_SPAN[b]", ";"],
             "var lo = Math.max(0, at - span - soft);",
-            "var g = ease(progress, lo, Math.max(lo + 0.001, at), 0, 100);",
+            ("var g = Math.max(0,Math.min(1,(progress-lo)/Math.max(0.001,at-lo)))*100;"
+             if s.comp.animation_mode in ("uniform_x","uniform_path") else
+             "var g = animEase((progress-lo)/Math.max(0.001,at-lo))*100;"),
             grow,
         ], indent=2)
 
@@ -1131,11 +1197,19 @@ function buildPlayhead() {{
         else:
             self.w('var vl = makeText(BAR_LABEL[b], 20, AXIS_COLOR, '
                    '[BAR_X[b], BAR_Y[b] - 16], "center");', 2)
+        self._emit_expr_assign('vl.property("Transform").property("Position")',[
+            CTRL,PROG,soft_line,
+            ["var at=", "~BAR_AT[b]", ", span=", "~BAR_SPAN[b]", ";"],
+            ["var x=", "~BAR_X[b]", ", y=", "~BAR_Y[b]", ", h=", "~BAR_H[b]", ", w=", "~BAR_W[b]", ", base=", "~BAR_BASE[b]", ", sign=", "~BAR_SIGN[b]", ";"],
+            "var lo=Math.max(0,at-span-soft); var u=Math.max(0,Math.min(1,(progress-lo)/Math.max(0.001,at-lo)));",
+            ("var g=u;" if s.comp.animation_mode in ("uniform_x","uniform_path") else "var g=animEase(u);"),
+            ("[base+sign*w*g+sign*16,y+7];" if horiz else "[x,base-sign*h*g-sign*16];")
+        ],indent=2)
         self._emit_expr_assign('vl.property("Transform").property("Opacity")', [
             'var ctrl = thisComp.layer("MASTER_CONTROLS");',
             f'var progress = ctrl.effect("{self._ctrl_names["progress"]}")("Slider");',
             ["var at = ", "~BAR_AT[b]", ";"],
-            f"var span = {fmt_num(round(bspan, 6))};",
+            ["var span = ", "~BAR_SPAN[b]", ";"],
             "var lo = Math.max(0, at - span);",
             "linear(progress, lo, Math.max(lo + 0.001, at), 0, 100);",
         ], indent=2)
@@ -1149,13 +1223,22 @@ function buildPlayhead() {{
                    "BAR_COLORS[BAR_CIDX[q]]);", 2)
             self.w('head.property("Transform").property("Position")'
                    '.setValue([BAR_X[q], BAR_Y[q]]);', 2)
+            self._emit_expr_assign('head.property("Transform").property("Position")',[
+                CTRL,PROG,soft_line,
+                ["var at=", "~BAR_AT[q]", ", span=", "~BAR_SPAN[q]", ", base=", "~BAR_BASE[q]", ", h=", "~BAR_H[q]", ", sign=", "~BAR_SIGN[q]", ", x=", "~BAR_X[q]", ";"],
+                "var lo=Math.max(0,at-span-soft); var u=Math.max(0,Math.min(1,(progress-lo)/Math.max(0.001,at-lo)));",
+                ("var g=u;" if s.comp.animation_mode in ("uniform_x","uniform_path") else "var g=animEase(u);"),
+                "[x,base-sign*h*g];"
+            ],indent=2)
             self._emit_expr_assign('head.property("Transform").property("Scale")', [
                 'var ctrl = thisComp.layer("MASTER_CONTROLS");',
                 f'var progress = ctrl.effect("{self._ctrl_names["progress"]}")("Slider");',
                 ["var at = ", "~BAR_AT[q]", ";"],
-                f"var span = {fmt_num(round(bspan, 6))};",
+                ["var span = ", "~BAR_SPAN[q]", ";"],
                 "var lo = Math.max(0, at - span);",
-                "var g = ease(progress, lo, Math.max(lo + 0.001, at), 0, 100);",
+                ("var g = Math.max(0,Math.min(1,(progress-lo)/Math.max(0.001,at-lo)))*100;"
+                 if s.comp.animation_mode in ("uniform_x","uniform_path") else
+                 "var g = animEase((progress-lo)/Math.max(0.001,at-lo))*100;"),
                 "[g, g];",
             ], indent=2)
             self.w("}", 1)
@@ -1185,6 +1268,7 @@ function buildPlayhead() {{
         self.w("var RING_W = RING_OUTER - RING_INNER;")
         self.w("var SEG_START = " + fmt_list([g.start * 100 for g in m.segments], r2) + ";")
         self.w("var SEG_END = " + fmt_list([g.end * 100 for g in m.segments], r2) + ";")
+        self.w("var SEG_SPAN = " + fmt_list([g.reveal_span for g in m.segments],lambda x:round(x,6)) + ";")
         self.w("var SEG_AT = " + fmt_list([g.reveal_at for g in m.segments], r2) + ";")
         self.w("var SEG_COLORS = [" + ", ".join(jcolor(g.color) for g in m.segments) + "];")
         self.w("var SEG_CTRL = [" + ", ".join(
@@ -1235,9 +1319,11 @@ function buildPlayhead() {{
             ["var a = ", "~SEG_START[g]", ";"],
             ["var b = ", "~SEG_END[g]", ";"],
             ["var at = ", "~SEG_AT[g]", ";"],
-            f"var span = {fmt_num(round(span, 6))};",
+            ["var span = ", "~SEG_SPAN[g]", ";"],
             "var hi = Math.max(at + span, at + 0.001);",
-            "a + gap + ease(progress, at, hi, 0, Math.max(0, b - a - gap));",
+            ("a + gap + Math.max(0,Math.min(1,(progress-at)/(hi-at)))*Math.max(0,b-a-2*gap);"
+             if s.comp.animation_mode in ("uniform_x","uniform_path") else
+             "a + gap + animEase((progress-at)/(hi-at))*Math.max(0,b-a-2*gap);"),
         ], indent=2)
         self.w("}", 1)
 
@@ -1261,7 +1347,7 @@ function buildPlayhead() {{
             self.w(f'slab{i}.property("Transform").property("Opacity").expression = ' + expr([
                 CTRL, PROG,
                 f"var at = {fmt_num(g.reveal_at)};",
-                f"var span = {fmt_num(round(span, 6))};",
+                f"var span = {fmt_num(round(g.reveal_span, 6))};",
                 "linear(progress, at, Math.max(at + span, at + 0.001), 0, 100);",
             ]) + ";")
 

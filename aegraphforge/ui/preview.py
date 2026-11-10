@@ -20,6 +20,9 @@ from PySide6.QtWidgets import (QCheckBox, QPushButton, QHBoxLayout, QLabel, QSli
                                QSizePolicy, QVBoxLayout, QWidget)
 
 from ..core.build import RenderModel
+from ..core.animation import overall_ease, item_ease, ramp
+from ..core.motion import state, risen_geometry
+from ..core.spec import CANDLESTICK, BOX_PLOT, HEATMAP
 from ..core.geometry import PathGeometry
 from ..core.spec import (AREA, BAR, CONNECTED_SCATTER, DONUT, HBAR, LOLLIPOP,
                          SCATTER, STACKED_AREA)
@@ -48,7 +51,7 @@ def progress_at_time(t: float, comp) -> float:
         return 0.0
     if t >= b or b <= a:
         return 100.0
-    return _ease((t - a) / (b - a)) * 100.0
+    return overall_ease((t - a) / (b - a), comp) * 100.0
 
 
 def time_at_progress(pct: float, comp) -> float:
@@ -61,7 +64,7 @@ def time_at_progress(pct: float, comp) -> float:
     lo, hi = 0.0, 1.0                       # smoothstep has no tidy inverse
     for _ in range(40):
         mid = (lo + hi) / 2.0
-        if _ease(mid) * 100.0 < pct:
+        if overall_ease(mid, comp) * 100.0 < pct:
             lo = mid
         else:
             hi = mid
@@ -120,7 +123,11 @@ class ChartCanvas(QWidget):
             self._donut(p, m)
         else:
             self._grid(p, m)
-            if m.spec.is_bar:
+            if m.marks:
+                self._marks(p,m)
+            elif m.spec.chart_type == CANDLESTICK:
+                self._candles(p, m)
+            elif m.spec.is_bar:
                 self._bars(p, m)
             else:
                 self._series(p, m)
@@ -160,6 +167,8 @@ class ChartCanvas(QWidget):
         p.drawText(r, Qt.AlignCenter, text)
 
     def _grid(self, p: QPainter, m: RenderModel) -> None:
+        if m.spec.chart_type == HEATMAP:
+            return
         st = m.spec.style
         L, T, R, B = m.plot_rect
         pen = QPen(qc(st.grid_color, st.grid_opacity / 100.0))
@@ -195,8 +204,9 @@ class ChartCanvas(QWidget):
         out = QPainterPath()
         steps = 400
         out.moveTo(path.pointAtPercent(0.0))
+        length = path.length()
         for i in range(1, steps + 1):
-            out.lineTo(path.pointAtPercent(frac * i / steps))
+            out.lineTo(path.pointAtPercent(path.percentAtLength(length * frac * i / steps)))
         return out
 
     def _series(self, p: QPainter, m: RenderModel) -> None:
@@ -205,18 +215,27 @@ class ChartCanvas(QWidget):
         for sm in m.series:
             g = sm.path
             if g is not None and sm.spec.show_line and m.spec.chart_type != SCATTER:
+                rise = m.spec.comp.animation_mode == "rise"
+                original = g
+                if rise:
+                    g = risen_geometry(g,m.spec,sm.baseline_pixel,prog)
                 qp = self._qpath(g)
-                frac = g.trim_at_progress(prog) / 100.0
+                trim,x,y = state(original,prog,m.spec)
+                frac = 1.0 if rise else trim/100.0
 
                 # area fill, wiped to the leading edge like the Linear Wipe does
                 if m.spec.chart_type in (AREA, STACKED_AREA) or sm.spec.fill_opacity > 0:
-                    tip = g.point_at_progress(prog)
+                    tip = (g.points[-1] if rise else (x,y))
                     fill = QPainterPath(self._trimmed(qp, frac))
                     if fill.elementCount() > 1:
                         if sm.lower_points:
                             # A stacked band closes along the series beneath it,
                             # walked backwards to the wipe edge.
-                            low = [pt for pt in sm.lower_points if pt[0] <= tip[0]]
+                            lower = sm.lower_points
+                            if rise:
+                                from ..core.geometry import build_path
+                                lower = risen_geometry(build_path(lower,False),m.spec,sm.baseline_pixel,prog).points
+                            low = [pt for pt in lower if pt[0] <= tip[0]]
                             if low:
                                 fill.lineTo(QPointF(tip[0], low[-1][1]))
                                 for pt in reversed(low):
@@ -246,13 +265,18 @@ class ChartCanvas(QWidget):
             soft = st.dot_reveal_lead
             for d in sm.dots:
                 lo = max(0.0, d.reveal_at - soft)
-                hi = max(lo + 0.001, d.reveal_at + d.reveal_span + soft * 0.33)
-                a = self._ramp(prog, lo, hi)
+                lag = soft*0.33 if st.bind_to_controls else st.dot_reveal_lag
+                hi = max(lo + 0.001, d.reveal_at + d.reveal_span + lag)
+                a = item_ease(self._ramp(prog, lo, hi),m.spec.comp,"linear")
                 if a <= 0.001:
                     continue
                 p.setBrush(qc(d.color, a * st.dot_opacity / 100.0))
                 r = d.diameter / 2.0
-                p.drawEllipse(QPointF(d.x, d.y), r, r)
+                dy = d.y
+                if m.spec.comp.animation_mode == "rise":
+                    w = item_ease(ramp(prog,d.reveal_at,d.reveal_span),m.spec.comp)
+                    dy = sm.baseline_pixel+(d.y-sm.baseline_pixel)*w
+                p.drawEllipse(QPointF(d.x, dy), r, r)
 
     @staticmethod
     def _ramp(v: float, lo: float, hi: float) -> float:
@@ -263,7 +287,7 @@ class ChartCanvas(QWidget):
     def _playhead(self, p: QPainter, m: RenderModel) -> None:
         st = m.spec.style
         paths = [sm for sm in m.series if sm.path is not None]
-        if not paths or m.spec.chart_type == SCATTER:
+        if not paths or m.spec.chart_type == SCATTER or m.spec.comp.animation_mode == "rise":
             return
         lead = paths[0]
         L, T, R, B = m.plot_rect
@@ -271,7 +295,8 @@ class ChartCanvas(QWidget):
         fade = self._ramp(prog, 0, 2) * (1.0 if prog < 99.5 else self._ramp(100 - prog, 0, 0.5))
         if fade <= 0.001:
             return
-        tip = lead.path.point_at_progress(prog)
+        _,tx,ty = state(lead.path,prog,m.spec)
+        tip = (tx,ty)
         if st.show_playhead:
             pen = QPen(qc((0.95, 0.95, 0.95), fade * st.playhead_opacity / 100.0))
             pen.setWidthF(2)
@@ -283,6 +308,44 @@ class ChartCanvas(QWidget):
             r = st.tip_dot_size / 2.0
             p.drawEllipse(QPointF(tip[0], tip[1]), r, r)
 
+    def _marks(self,p,m):
+        from ..core.distributions import mark_state
+        for mark in m.marks:
+            x,y,w,h,g = mark_state(mark,self.progress,m.spec)
+            if g <= 0:
+                continue
+            pen = QPen(qc(mark.color,g))
+            pen.setWidthF(2)
+            p.setPen(pen if mark.kind=="outline" else Qt.NoPen)
+            p.setBrush(Qt.NoBrush if mark.kind=="outline" else QBrush(qc(mark.color,g)))
+            rect = QRectF(x-w/2,y-h/2,w,h)
+            if mark.kind=="dot":
+                p.drawEllipse(rect)
+            else:
+                p.drawRect(rect)
+            if mark.text:
+                size = min(m.spec.style.legend_size,(w-6)/max(1,len(mark.text)*0.65),h-4)
+                if size>=8:
+                    lum = sum(a*b for a,b in zip(mark.color,(0.2126,0.7152,0.0722)))
+                    color = (0.05,0.05,0.05) if lum>0.55 else (1,1,1)
+                    self._text(p,mark.text,size,qc(color,g),(x,y+size*0.35),"center")
+
+    def _candles(self, p, m):
+        for candle in m.candles:
+            w = item_ease(ramp(self.progress,candle.reveal_at,candle.reveal_span),m.spec.comp)
+            if w <= 0:
+                continue
+            base = m.spec.comp.plot_bottom if m.spec.comp.animation_mode == "rise" else candle.open_y
+            def y(v):
+                return base+(v-base)*w
+            pen = QPen(qc(candle.color))
+            pen.setWidthF(2)
+            p.setPen(pen)
+            p.drawLine(QPointF(candle.x,y(candle.high_y)),QPointF(candle.x,y(candle.low_y)))
+            p.setBrush(qc(candle.color))
+            top,bottom = sorted((y(candle.open_y),y(candle.close_y)))
+            p.drawRect(QRectF(candle.x-candle.width/2,top,candle.width,max(1,bottom-top)))
+
     def _bars(self, p: QPainter, m: RenderModel) -> None:
         horiz = m.spec.chart_type == HBAR
         prog = self.progress
@@ -292,7 +355,7 @@ class ChartCanvas(QWidget):
         for b in m.bars:
             lo = max(0.0, b.reveal_at - b.reveal_span - soft)
             t = self._ramp(prog, lo, max(lo + 0.001, b.reveal_at))
-            t = t * t * (3 - 2 * t)                      # ease(), roughly
+            t = t if m.spec.comp.animation_mode in ("uniform_x","uniform_path") else item_ease(t,m.spec.comp)
             if t <= 0.001:
                 continue
             if horiz:
@@ -311,7 +374,7 @@ class ChartCanvas(QWidget):
                 r = m.spec.lollipop_dot / 2.0 * t
                 if r > 0.2:
                     p.setBrush(qc(b.color))
-                    cy = b.y if b.y < b.base else b.y + b.height
+                    cy = b.base + (-1 if b.y < b.base else 1)*b.height*t
                     p.drawEllipse(QPointF(b.x, cy), r, r)
 
             llo2 = llo
@@ -319,8 +382,8 @@ class ChartCanvas(QWidget):
             if la > 0.01:
                 self._text(p, b.value_label or b.label, 20,
                            qc(m.spec.style.axis_text_color, la),
-                           (rect.right() + 16, rect.center().y() + 7) if horiz
-                           else (rect.center().x(), rect.top() - 16),
+                           ((b.base+(1 if b.x>=b.base else -1)*(b.width*t+16)),b.y+7) if horiz
+                           else (b.x,b.base+(-1 if b.y<b.base else 1)*(b.height*t+16)),
                            "left" if horiz else "center")
 
     def _text(self, p: QPainter, s: str, size: float, color: QColor,
@@ -379,7 +442,7 @@ class ChartCanvas(QWidget):
             lo = seg.reveal_at
             hi = max(lo + 0.001, seg.reveal_at + seg.reveal_span)
             t = self._ramp(prog, lo, hi)
-            t = t * t * (3 - 2 * t)                     # ease(), as in the script
+            t = t if m.spec.comp.animation_mode in ("uniform_x","uniform_path") else item_ease(t,m.spec.comp)
             if t <= 0.001:
                 continue
             pen = QPen(qc(seg.color))

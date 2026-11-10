@@ -27,6 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from aegraphforge.core.animation import EASE_FAMILIES, ANIMATION_MODES
 from aegraphforge.core.build import build_model
 from aegraphforge.core.dataset import CATEGORY, Dataset
 from aegraphforge.core.jsxgen import generate_jsx
@@ -58,6 +59,22 @@ def cmd_build(args) -> int:
         spec.chart_type = args.type
     if args.x:
         spec.x_column = args.x
+    for key in ("value_column","histogram_bins","histogram_normalization","heatmap_x","heatmap_y"):
+        if getattr(args,key) is not None:
+            setattr(spec,key,getattr(args,key))
+    if args.no_outliers:
+        spec.box_show_outliers = False
+    if args.no_cell_values:
+        spec.heatmap_show_values = False
+    for key in ("open","high","low","close"):
+        if getattr(args,key):
+            setattr(spec,"candle_"+key,getattr(args,key))
+    for key in ("animation_mode","ease_family","ease_start","ease_end",
+                "item_ease_family","item_ease_in","item_ease_out","stagger_seconds"):
+        if getattr(args,key) is not None:
+            setattr(spec.comp,key,getattr(args,key))
+    if args.reverse_stagger:
+        spec.comp.reverse_stagger = True
     if args.sort:
         spec.sort_column = args.sort
     # grouping, shared by every bar type, the lollipop and the donut
@@ -115,7 +132,7 @@ def cmd_build(args) -> int:
     if not spec.x_column:
         plott = ds.plottable_names()
         spec.x_column = plott[0] if plott else ds.names[0]
-    if not spec.series:
+    if not spec.series and spec.chart_type not in ("histogram","box_plot","heatmap","candlestick"):
         nums = [n for n in ds.numeric_names() if n != spec.x_column]
         if not nums:
             print("error: no numeric column available for Y", file=sys.stderr)
@@ -160,6 +177,24 @@ def main(argv=None) -> int:
     pb.add_argument("--save-preset", help="write the resolved spec back out")
     pb.add_argument("--type", choices=[k for k, _ in CHART_TYPES])
     pb.add_argument("--x")
+    pb.add_argument("--value-column",help="Numeric values for histogram, box plot or heatmap")
+    pb.add_argument("--histogram-bins",type=int,help="0 = automatic; otherwise 1..200")
+    pb.add_argument("--histogram-normalization",choices=["count","probability","density"])
+    pb.add_argument("--heatmap-x",help="Heatmap column categories")
+    pb.add_argument("--heatmap-y",help="Heatmap row categories")
+    pb.add_argument("--no-outliers",action="store_true")
+    pb.add_argument("--no-cell-values",action="store_true")
+    for key in ("open","high","low","close"):
+        pb.add_argument("--"+key, help="Candlestick "+key+" column")
+    pb.add_argument("--animation-mode",choices=[k for k,_ in ANIMATION_MODES])
+    pb.add_argument("--ease-family",choices=[k for k,_ in EASE_FAMILIES])
+    pb.add_argument("--ease-start",type=float)
+    pb.add_argument("--ease-end",type=float)
+    pb.add_argument("--item-ease-family",choices=["original"]+[k for k,_ in EASE_FAMILIES])
+    pb.add_argument("--item-ease-in",type=float)
+    pb.add_argument("--item-ease-out",type=float)
+    pb.add_argument("--stagger-seconds",type=float)
+    pb.add_argument("--reverse-stagger",action="store_true")
     pb.add_argument("--y", nargs="+",
                     help="one or more Y columns, optionally COLUMN:transform "
                          f"({', '.join(k for k, _ in TRANSFORMS)})")

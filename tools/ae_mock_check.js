@@ -68,6 +68,7 @@ function makeHost() {
   Property.prototype.setValue = function (v) { this._value = v; return v; };
   Property.prototype.setValueAtTime = function (t, v) { this._keys.push([t, v]); this._value = v; };
   Property.prototype.setTemporalEaseAtKey = function () {};
+  Property.prototype.setInterpolationTypeAtKey = function () {};
   Property.prototype.valueAtTime = function () { return this._value; };
   Object.defineProperty(Property.prototype, 'expression', {
     set(v) { this._expr = v; installed.push({ path: this._path, expression: v, prop: this }); },
@@ -114,6 +115,7 @@ function makeHost() {
     },
     Shape: function () { this.vertices = []; this.inTangents = []; this.outTangents = []; this.closed = false; },
     KeyframeEase: function (speed, influence) { this.speed = speed; this.influence = influence; },
+    KeyframeInterpolationType: { LINEAR: 1, BEZIER: 2 },
     ParagraphJustification: { LEFT_JUSTIFY: 0, RIGHT_JUSTIFY: 1, CENTER_JUSTIFY: 2 },
     alert: (m) => alerts.push(m),
     Math, String, Number, Array, Object, JSON, parseInt, parseFloat, isNaN,
@@ -148,8 +150,15 @@ function makeExprContext(effects, progress) {
       },
       width: 1920, height: 1080, duration: 14,
     },
-    time: 0,
-    value: 0,
+    time: progress / 100 * 14,
+    value: progress,
+    createPath(points, inTangents, outTangents, closed) {
+      if (!points.length || points.length !== inTangents.length || points.length !== outTangents.length)
+        throw new Error('createPath: mismatched geometry');
+      if (!points.every(p => p.every(Number.isFinite))) throw new Error('createPath: nonfinite vertex');
+      if (![...inTangents,...outTangents].every(p => p.every(Number.isFinite))) throw new Error('createPath: nonfinite tangent');
+      return { points, inTangents, outTangents, closed };
+    },
     linear(t, tMin, tMax, v1, v2) {
       if (arguments.length === 3) { v1 = tMin; v2 = tMax; tMin = 0; tMax = 1; }
       if (tMax === tMin) return t < tMin ? v1 : v2;
@@ -238,7 +247,7 @@ function check(file) {
           vm.createContext(makeExprContext(host.effects, prog)), { timeout: 3000 });
         // A bar's Scale is [100, g] or [g, 100], so the growing component is
         // the minimum. For scalar opacity min and max are the same value.
-        return Array.isArray(v) ? Math.min(...v.map(Number)) : Number(v);
+        return Array.isArray(v) ? Math.min(...v.map(x => Math.abs(Number(x)))) : Number(v);
       } catch { return NaN; }
     };
     // A Trim Paths End is "empty" when it equals its own Start, not when it

@@ -18,6 +18,11 @@ RGB = Tuple[float, float, float]
 # ---------------------------------------------------------------------------
 # chart types
 # ---------------------------------------------------------------------------
+HISTOGRAM = "histogram"
+BOX_PLOT = "box_plot"
+HEATMAP = "heatmap"
+CANDLESTICK = "candlestick"
+
 LINE = "line"                            # one or more lines vs a continuous X
 AREA = "area"                            # line + fill to baseline
 CONNECTED_SCATTER = "connected_scatter"  # X vs Y, path follows a sort order
@@ -33,6 +38,10 @@ LOLLIPOP = "lollipop"
 DONUT = "donut"
 
 CHART_TYPES = [
+    (HISTOGRAM, "Histogram"),
+    (BOX_PLOT, "Box plot"),
+    (HEATMAP, "Heatmap"),
+    (CANDLESTICK, "Candlestick (OHLC)"),
     (LINE, "Line / Multi-line"),
     (STEP_LINE, "Step line"),
     (AREA, "Area"),
@@ -48,7 +57,7 @@ CHART_TYPES = [
 ]
 
 # charts driven by the bar/aggregation pipeline rather than the point pipeline
-BAR_LIKE = (BAR, HBAR, GROUPED_BAR, STACKED_BAR, LOLLIPOP)
+BAR_LIKE = (BAR, HBAR, GROUPED_BAR, STACKED_BAR, LOLLIPOP, HISTOGRAM)
 # charts that draw one path per series
 PATH_LIKE = (LINE, STEP_LINE, AREA, STACKED_AREA, CONNECTED_SCATTER)
 
@@ -254,7 +263,16 @@ class CompSpec:
     plot_bottom: float = 860.0
     progress_start: float = 1.0
     progress_end: float = 12.0
-    ease_influence: float = 33.0
+    ease_influence: float = 33.0  # legacy presets: fallback for both ends
+    ease_family: str = "bezier"
+    ease_start: Optional[float] = None
+    ease_end: Optional[float] = None
+    item_ease_family: str = "original"
+    item_ease_in: float = 100.0
+    item_ease_out: float = 100.0
+    animation_mode: str = "legacy"  # legacy | uniform_x | uniform_path | rise
+    stagger_seconds: float = 0.08
+    reverse_stagger: bool = False
     open_in_viewer: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
@@ -346,6 +364,22 @@ class ReadoutSpec:
 
 @dataclass
 class ChartSpec:
+    value_column: str = ""
+    histogram_color: RGB = (0.4, 0.85, 0.9)
+    histogram_bins: int = 0  # 0 = auto (square-root rule)
+    histogram_normalization: str = "count"  # count | probability | density
+    box_show_outliers: bool = True
+    heatmap_x: str = ""
+    heatmap_y: str = ""
+    heatmap_show_values: bool = True
+    heatmap_low_color: RGB = (0.12, 0.20, 0.35)
+    heatmap_high_color: RGB = (0.95, 0.65, 0.25)
+    candle_open: str = ""
+    candle_high: str = ""
+    candle_low: str = ""
+    candle_close: str = ""
+    candle_up_color: RGB = (0.25, 0.8, 0.55)
+    candle_down_color: RGB = (0.95, 0.35, 0.4)
     chart_type: str = LINE
     x_column: str = ""
     sort_column: str = ""             # blank = keep CSV row order
@@ -387,7 +421,7 @@ class ChartSpec:
 
     @property
     def uses_path(self) -> bool:
-        return self.chart_type in (LINE, AREA, CONNECTED_SCATTER)
+        return self.chart_type in PATH_LIKE
 
     def left_series(self) -> List[SeriesSpec]:
         return [s for s in self.series if s.axis == "left"]
@@ -398,6 +432,22 @@ class ChartSpec:
     # -- persistence --------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "value_column": self.value_column,
+            "histogram_color": list(self.histogram_color),
+            "histogram_bins": self.histogram_bins,
+            "histogram_normalization": self.histogram_normalization,
+            "box_show_outliers": self.box_show_outliers,
+            "heatmap_x": self.heatmap_x,
+            "heatmap_y": self.heatmap_y,
+            "heatmap_show_values": self.heatmap_show_values,
+            "heatmap_low_color": list(self.heatmap_low_color),
+            "heatmap_high_color": list(self.heatmap_high_color),
+            "candle_open": self.candle_open,
+            "candle_high": self.candle_high,
+            "candle_low": self.candle_low,
+            "candle_close": self.candle_close,
+            "candle_up_color": list(self.candle_up_color),
+            "candle_down_color": list(self.candle_down_color),
             "chart_type": self.chart_type,
             "x_column": self.x_column,
             "sort_column": self.sort_column,
@@ -443,6 +493,13 @@ class ChartSpec:
                     "donut_other_label", "slice_sort"):
             if key in d:
                 setattr(spec, key, d[key])
+        for key in ("value_column", "histogram_color", "histogram_bins", "histogram_normalization",
+                    "box_show_outliers", "heatmap_x", "heatmap_y", "heatmap_show_values",
+                    "heatmap_low_color", "heatmap_high_color",
+                    "candle_open", "candle_high", "candle_low", "candle_close",
+                    "candle_up_color", "candle_down_color"):
+            if key in d:
+                setattr(spec, key, tuple(d[key]) if key.endswith("color") else d[key])
         spec._migrate_legacy(d)
         spec.series = []
         for sd in d.get("series", []):

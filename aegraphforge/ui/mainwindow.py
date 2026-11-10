@@ -41,7 +41,10 @@ APP_NAME = "AE Graph Forge"
 
 # Chart types whose rows are aggregated into groups before anything is drawn.
 # All of them read Group by / Aggregate / Order, not just the plain bars.
-GROUPED_TYPES = tuple(BAR_LIKE) + (DONUT,)
+from ..core.animation import EASE_FAMILIES, ANIMATION_MODES
+from ..core.spec import CANDLESTICK, HISTOGRAM, BOX_PLOT, HEATMAP
+
+GROUPED_TYPES = tuple(t for t in BAR_LIKE if t != HISTOGRAM) + (DONUT,)
 # ... and of those, the ones that colour each group individually. Grouped and
 # stacked bars take their colours from the series instead.
 PER_GROUP_COLOR = (BAR, HBAR, LOLLIPOP, DONUT)
@@ -276,8 +279,69 @@ class MainWindow(QMainWindow):
         self.grp_donut = group("Donut / Pie", df)
         lay.addWidget(self.grp_donut)
 
+        of = form()
+        self.ohlc_boxes = {}
+        for key in ("open", "high", "low", "close"):
+            box = WideComboBox()
+            self.ohlc_boxes[key] = box
+            of.addRow(key.title() + " column", box)
+        self.candle_up = ColorButton((0.25,0.8,0.55))
+        self.candle_down = ColorButton((0.95,0.35,0.4))
+        of.addRow("Up colour", self.candle_up)
+        of.addRow("Down colour", self.candle_down)
+        of.addRow(hint("One candle per row. Low must be at or below Open/Close; High must be at or above them."))
+        self.grp_candle = group("Candlestick / OHLC", of)
+        lay.addWidget(self.grp_candle)
+
+        vf = form()
+        self.cb_value = WideComboBox()
+        vf.addRow("Value column",self.cb_value)
+        self.grp_value = group("Values",vf)
+        lay.addWidget(self.grp_value)
+        hf = form()
+        self.sp_bins = spin(0,200,0)
+        self.cb_hist_norm = combo([("count","Count"),("probability","Probability"),("density","Density")],"count")
+        self.hist_color = ColorButton((0.4,0.85,0.9))
+        hf.addRow("Bins (0 = auto)",self.sp_bins)
+        hf.addRow("Height",self.cb_hist_norm)
+        hf.addRow("Colour",self.hist_color)
+        hf.addRow(hint("Equal-width bins; the last bin includes the maximum. Auto uses the square-root rule. Probability sums to 1; density has total area 1. Axes must be linear."))
+        self.grp_hist = group("Histogram",hf)
+        lay.addWidget(self.grp_hist)
+        bf = form()
+        self.cb_box_group = WideComboBox()
+        self.ck_outliers = QCheckBox("Show outliers")
+        self.ck_outliers.setChecked(True)
+        self.cb_box_order = combo(SLICE_SORTS,"value_desc")
+        self.sp_box_groups = spin(0,200,20)
+        bf.addRow("Group by (optional)",self.cb_box_group)
+        bf.addRow("Order (value = median)",self.cb_box_order)
+        bf.addRow("Max groups (0 = all)",self.sp_box_groups)
+        bf.addRow("",self.ck_outliers)
+        bf.addRow(hint("Box = middle 50%, line = median. Whiskers end at observations within 1.5 x IQR. Quartiles use linear interpolation."))
+        self.grp_box = group("Box plot",bf)
+        lay.addWidget(self.grp_box)
+        mf = form()
+        self.cb_heat_x = WideComboBox()
+        self.cb_heat_y = WideComboBox()
+        self.cb_heat_agg = combo(AGGREGATIONS,"sum")
+        self.ck_heat_values = QCheckBox("Show cell values")
+        self.ck_heat_values.setChecked(True)
+        self.heat_low = ColorButton((0.12,0.2,0.35))
+        self.heat_high = ColorButton((0.95,0.65,0.25))
+        mf.addRow("Columns",self.cb_heat_x)
+        mf.addRow("Rows",self.cb_heat_y)
+        mf.addRow("Aggregate",self.cb_heat_agg)
+        mf.addRow("Low colour",self.heat_low)
+        mf.addRow("High colour",self.heat_high)
+        mf.addRow("",self.ck_heat_values)
+        mf.addRow(hint("Duplicate row/column pairs are aggregated. Missing combinations stay blank; zero is a valid value. Count needs no numeric Value mapping. Category order follows the CSV. Limit: 1600 cells."))
+        self.grp_heat = group("Heatmap",mf)
+        lay.addWidget(self.grp_heat)
+
         # -- series -------------------------------------------------------
         sgroup = QGroupBox("Y series")
+        self.grp_series = sgroup
         sl = QVBoxLayout(sgroup)
         self.series_list = QListWidget()
         self.series_list.setMaximumHeight(96)
@@ -571,6 +635,14 @@ class MainWindow(QMainWindow):
         self.sp_pstart = spin(0, 3600, 1.0, 0.1, 2, " s")
         self.sp_pend = spin(0, 3600, 12.0, 0.1, 2, " s")
         self.sp_ease = spin(0, 100, 33, 1, 0, " %")
+        self.sp_ease_end = spin(0, 100, 33, 1, 0, " %")
+        self.cb_ease_family = combo(EASE_FAMILIES, "bezier")
+        self.cb_item_family = combo([("original","Original (per chart)")]+EASE_FAMILIES, "original")
+        self.sp_item_in = spin(0,100,100,1,0," %")
+        self.sp_item_out = spin(0,100,100,1,0," %")
+        self.cb_animation = combo(ANIMATION_MODES,"legacy")
+        self.sp_stagger = spin(0,60,0.08,0.01,3," s")
+        self.ck_reverse = QCheckBox("Reverse stagger order")
         self.cb_arc = combo([("chord", "Chord length (matches your scripts)"),
                              ("bezier", "True bezier arc length")], "chord")
         self.cb_arc.setToolTip(
@@ -589,7 +661,18 @@ class MainWindow(QMainWindow):
             "series and category, then binds every layer to them.")
         af.addRow("Progress start", self.sp_pstart)
         af.addRow("Progress end", self.sp_pend)
-        af.addRow("Keyframe ease", self.sp_ease)
+        af.addRow("Animation style", self.cb_animation)
+        af.addRow("Overall easing", self.cb_ease_family)
+        af.addRow("Start ease", self.sp_ease)
+        af.addRow("End ease", self.sp_ease_end)
+        af.addRow("Per-item easing", self.cb_item_family)
+        af.addRow("Item ease in", self.sp_item_in)
+        af.addRow("Item ease out", self.sp_item_out)
+        af.addRow("Rise delay per item", self.sp_stagger)
+        af.addRow("", self.ck_reverse)
+        af.addRow(hint("Overall easing shapes the entire animation. Per-item easing shapes each point, bar or slice. "
+                       "Use Linear overall easing for constant draw speed. Uniform pie draw-on uses a continuous angular sweep. "
+                       "Rise delay 0 animates every item together; reverse changes the stagger order. Delays follow eased Progress."))
         af.addRow("Arc measure", self.cb_arc)
         af.addRow("Max dot layers", self.sp_maxdots)
         af.addRow("", self.chk_bind)
@@ -653,6 +736,10 @@ class MainWindow(QMainWindow):
         s.x_column = self.cb_x.currentData() or ""
         s.sort_column = self.cb_sort.currentData() or ""
         s.sort_ascending = self.chk_sort_asc.isChecked()
+        for key,box in self.ohlc_boxes.items():
+            setattr(s,"candle_"+key,box.currentData() or "")
+        s.candle_up_color = self.candle_up.rgb()
+        s.candle_down_color = self.candle_down.rgb()
         s.group_column = self.cb_group.currentData() or ""
         s.aggregation = self.cb_agg.currentData() or "sum"
         s.slice_sort = self.cb_slice_sort.currentData() or "value_desc"
@@ -667,6 +754,23 @@ class MainWindow(QMainWindow):
         s.donut_label_place = self.cb_dplace.currentData() or "outside"
         s.donut_label_min_pct = float(self.sp_dminpct.value())
         s.arc_mode = self.cb_arc.currentData() or "chord"
+
+        s.value_column = self.cb_value.currentData() or ""
+        s.histogram_bins = int(self.sp_bins.value())
+        s.histogram_normalization = self.cb_hist_norm.currentData() or "count"
+        s.histogram_color = self.hist_color.rgb()
+        s.box_show_outliers = self.ck_outliers.isChecked()
+        s.heatmap_x = self.cb_heat_x.currentData() or ""
+        s.heatmap_y = self.cb_heat_y.currentData() or ""
+        s.heatmap_show_values = self.ck_heat_values.isChecked()
+        s.heatmap_low_color = self.heat_low.rgb()
+        s.heatmap_high_color = self.heat_high.rgb()
+        if s.chart_type == BOX_PLOT:
+            s.group_column = self.cb_box_group.currentData() or ""
+            s.slice_sort = self.cb_box_order.currentData() or "data"
+            s.max_bars = int(self.sp_box_groups.value())
+        elif s.chart_type == HEATMAP:
+            s.aggregation = self.cb_heat_agg.currentData() or "sum"
 
         # axes
         for prefix, axis in (("ax", s.x_axis), ("ay", s.y_axis), ("ay2", s.y2_axis)):
@@ -762,6 +866,15 @@ class MainWindow(QMainWindow):
         c.progress_start = float(self.sp_pstart.value())
         c.progress_end = float(self.sp_pend.value())
         c.ease_influence = float(self.sp_ease.value())
+        c.ease_start = float(self.sp_ease.value())
+        c.ease_end = float(self.sp_ease_end.value())
+        c.ease_family = self.cb_ease_family.currentData()
+        c.item_ease_family = self.cb_item_family.currentData()
+        c.item_ease_in = float(self.sp_item_in.value())
+        c.item_ease_out = float(self.sp_item_out.value())
+        c.animation_mode = self.cb_animation.currentData()
+        c.stagger_seconds = float(self.sp_stagger.value())
+        c.reverse_stagger = self.ck_reverse.isChecked()
         c.open_in_viewer = self.chk_open.isChecked()
 
         self._commit_series_editor()
@@ -773,7 +886,25 @@ class MainWindow(QMainWindow):
             s = self.spec
             i = self.cb_type.findData(s.chart_type)
             self.cb_type.setCurrentIndex(max(0, i))
+            self._select(self.cb_value,s.value_column)
+            self.sp_bins.setValue(s.histogram_bins)
+            self._select(self.cb_hist_norm,s.histogram_normalization)
+            self.hist_color.set_rgb(s.histogram_color)
+            self._select(self.cb_box_group,s.group_column)
+            self._select(self.cb_box_order,s.slice_sort)
+            self.sp_box_groups.setValue(s.max_bars)
+            self.ck_outliers.setChecked(s.box_show_outliers)
+            self._select(self.cb_heat_x,s.heatmap_x)
+            self._select(self.cb_heat_y,s.heatmap_y)
+            self._select(self.cb_heat_agg,s.aggregation)
+            self.ck_heat_values.setChecked(s.heatmap_show_values)
+            self.heat_low.set_rgb(s.heatmap_low_color)
+            self.heat_high.set_rgb(s.heatmap_high_color)
             self._select(self.cb_x, s.x_column)
+            for key,box in self.ohlc_boxes.items():
+                self._select(box,getattr(s,"candle_"+key))
+            self.candle_up.set_rgb(s.candle_up_color)
+            self.candle_down.set_rgb(s.candle_down_color)
             self._select(self.cb_sort, s.sort_column)
             self.chk_sort_asc.setChecked(s.sort_ascending)
             self._select(self.cb_group, s.group_column)
@@ -872,7 +1003,15 @@ class MainWindow(QMainWindow):
             self.sp_pb.setValue(c.plot_bottom)
             self.sp_pstart.setValue(c.progress_start)
             self.sp_pend.setValue(c.progress_end)
-            self.sp_ease.setValue(c.ease_influence)
+            self.sp_ease.setValue(c.ease_influence if c.ease_start is None else c.ease_start)
+            self.sp_ease_end.setValue(c.ease_influence if c.ease_end is None else c.ease_end)
+            self._select(self.cb_ease_family,c.ease_family)
+            self._select(self.cb_item_family,c.item_ease_family)
+            self.sp_item_in.setValue(c.item_ease_in)
+            self.sp_item_out.setValue(c.item_ease_out)
+            self._select(self.cb_animation,c.animation_mode)
+            self.sp_stagger.setValue(c.stagger_seconds)
+            self.ck_reverse.setChecked(c.reverse_stagger)
             self.chk_open.setChecked(c.open_in_viewer)
 
             self._refresh_series_list()
@@ -1002,16 +1141,40 @@ class MainWindow(QMainWindow):
         """
         t = self.cb_type.currentData()
         grouped = t in GROUPED_TYPES
+        self.grp_candle.setVisible(t == CANDLESTICK)
+        new_type = t in (HISTOGRAM,BOX_PLOT,HEATMAP)
+        self.grp_series.setVisible(t != CANDLESTICK and not new_type)
+        self.grp_value.setVisible(new_type)
+        self.grp_hist.setVisible(t == HISTOGRAM)
+        self.grp_box.setVisible(t == BOX_PLOT)
+        self.grp_heat.setVisible(t == HEATMAP)
+        self.cb_x.setEnabled(not new_type)
         self.grp_bar.setVisible(grouped)
         self.grp_slice_colors.setVisible(t in PER_GROUP_COLOR)
         self.grp_lolli.setVisible(t == LOLLIPOP)
         self.grp_donut.setVisible(t == DONUT)
         self.lbl_maxbars.setText("Max slices" if t == DONUT else "Max groups")
         # a donut has no axes to sort against; its order is the slice order
-        self.cb_sort.setEnabled(not grouped)
-        self.chk_sort_asc.setEnabled(not grouped)
+        self.cb_sort.setEnabled(not grouped and not new_type)
+        self.chk_sort_asc.setEnabled(not grouped and not new_type)
         if self._loading:
             return
+        if new_type and self.ds is not None:
+            if not self.cb_value.currentData():
+                nums = self.ds.numeric_names()
+                pick = self.spec.series[0].column if self.spec.series else (nums[0] if nums else "")
+                self._select(self.cb_value,pick)
+            if t == HEATMAP:
+                names = self.ds.category_names() or self.ds.names
+                if not self.cb_heat_x.currentData() and names:
+                    self._select(self.cb_heat_x,names[0])
+                if not self.cb_heat_y.currentData() and names:
+                    self._select(self.cb_heat_y,names[min(1,len(names)-1)])
+        if t == CANDLESTICK and self.ds is not None:
+            for key,box in self.ohlc_boxes.items():
+                if not box.currentData():
+                    name = next((n for n in self.ds.numeric_names() if n.lower()==key),"")
+                    self._select(box,name)
         # Switching to a grouped chart with nothing to group by would put one
         # slice on every row, so fall to the first category column instead.
         if grouped and not self.cb_group.currentData() and self.ds is not None:
@@ -1232,6 +1395,14 @@ class MainWindow(QMainWindow):
         fill_columns(self.cb_size, nums, allow_blank=True)
         fill_columns(self.cb_readout, plott, allow_blank=True)
         fill_columns(self.se_col, nums or ds.names)
+        fill_columns(self.cb_value,nums,allow_blank=True)
+        fill_columns(self.cb_box_group,ds.names,allow_blank=True)
+        fill_columns(self.cb_heat_x,ds.names,allow_blank=True)
+        fill_columns(self.cb_heat_y,ds.names,allow_blank=True)
+        for key,box in self.ohlc_boxes.items():
+            fill_columns(box, nums, allow_blank=True)
+            picked = next((name for name in nums if name.lower()==key),"")
+            self._select(box,getattr(self.spec,"candle_"+key) or picked)
         self._loading = False
 
     def _fill_table(self) -> None:
@@ -1319,7 +1490,11 @@ class MainWindow(QMainWindow):
         else:
             msg = f"{m.n_points} points · {len(m.series)} series"
             if m.bars:
-                msg = f"{len(m.bars)} bars"
+                msg = f"{len(m.bars)} bins" if self.spec.chart_type==HISTOGRAM else f"{len(m.bars)} bars"
+            elif m.boxes:
+                msg = f"{len(m.boxes)} box-plot groups"
+            elif m.cells:
+                msg = f"{len(m.cells)} heatmap cells"
             if m.warnings:
                 msg += "  ·  " + "; ".join(m.warnings[:2])
             self.statusBar().showMessage(msg)

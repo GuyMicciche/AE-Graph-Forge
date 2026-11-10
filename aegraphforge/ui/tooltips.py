@@ -226,8 +226,15 @@ TIPS: Dict[str, str] = {
                  "The gap before it is breathing room at the head of the shot.",
     "sp_pend": "Time Progress reaches 100.\n"
                "The gap after it lets the finished graph hold on screen.",
-    "sp_ease": "Keyframe ease influence on the Progress keyframes.\n"
-               "Higher settles more gently into the ends.",
+    "sp_ease": "Overall start ease. For Bezier this is outgoing keyframe influence; for named curves it blends Linear (0%) to the full curve (100%).",
+    "sp_ease_end": "Overall end ease, independent of the start. Bezier uses incoming keyframe influence.",
+    "cb_ease_family": "Curve for the entire Progress animation. Linear gives constant clock speed; start/end strengths independently shape other curves.",
+    "cb_item_family": "Curve inside each point/bar/slice interval. Original preserves each chart's previous behavior. Uniform draw-on bypasses item easing to preserve speed.",
+    "sp_item_in": "Per-item ease-in strength (0% linear, 100% full curve).",
+    "sp_item_out": "Per-item ease-out strength, independent of ease-in.",
+    "cb_animation": "Original follows data order. Uniform across screen sweeps X at a steady rate; uniform path follows distance. Rise animates all items with overlapping delays.",
+    "sp_stagger": "Delay per item in seconds of the uneased Progress interval. 0 animates all items together. Excessive delay is shortened to fit, with a warning.",
+    "ck_reverse": "Reverse the order in which items start rising.",
     "sp_pl": "Left edge of the plotting area, in composition pixels.",
     "sp_pr": "Right edge of the plotting area.",
     "sp_pt": "Top edge of the plotting area.",
